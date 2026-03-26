@@ -26,6 +26,8 @@ _BUNDLED_TEXT_CORPORA: Dict[str, tuple[str, str]] = {
     "tinystories": ("tinystories_train.txt", "tinystories_val.txt"),
 }
 
+_EVAL_MESSAGE_ABLATION_MODES = ("zero_all", "noise", "mask")
+
 
 @dataclass
 class RegionInterfaceConfig:
@@ -73,6 +75,10 @@ class RegionInterfaceConfig:
     message_dim: int = 64
     message_hidden_dim: int = 0
     message_scale_init: float = 0.5
+    eval_message_ablation: str = "none"
+    eval_all_message_ablations: bool = False
+    message_noise_std: float = 1.0
+    message_mask_keep_prob: float = 0.5
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -128,6 +134,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--message-dim", type=int, default=64)
     p.add_argument("--message-hidden-dim", type=int, default=0)
     p.add_argument("--message-scale-init", type=float, default=0.5)
+    p.add_argument("--eval-message-ablation", type=str, default="none")
+    p.add_argument("--eval-all-message-ablations", action="store_true")
+    p.add_argument("--message-noise-std", type=float, default=1.0)
+    p.add_argument("--message-mask-keep-prob", type=float, default=0.5)
     return p
 
 
@@ -177,6 +187,10 @@ def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
         message_dim=args.message_dim,
         message_hidden_dim=args.message_hidden_dim,
         message_scale_init=args.message_scale_init,
+        eval_message_ablation=args.eval_message_ablation,
+        eval_all_message_ablations=args.eval_all_message_ablations,
+        message_noise_std=args.message_noise_std,
+        message_mask_keep_prob=args.message_mask_keep_prob,
     )
     if cfg.regime not in {"native_region_interface", "all"}:
         raise ValueError("regime must be one of: native_region_interface, all")
@@ -209,6 +223,12 @@ def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
         raise ValueError("message_hidden_dim must be >= 0.")
     if cfg.message_scale_init <= 0.0:
         raise ValueError("message_scale_init must be > 0.")
+    if cfg.eval_message_ablation not in {"none", *_EVAL_MESSAGE_ABLATION_MODES}:
+        raise ValueError("eval_message_ablation must be one of: none, zero_all, noise, mask")
+    if cfg.message_noise_std < 0.0:
+        raise ValueError("message_noise_std must be >= 0.")
+    if cfg.message_mask_keep_prob <= 0.0 or cfg.message_mask_keep_prob > 1.0:
+        raise ValueError("message_mask_keep_prob must be in (0, 1].")
     return cfg
 
 
@@ -460,6 +480,14 @@ def _prepare_run_dir(cfg: RegionInterfaceConfig, regime_root: str) -> Path:
     return out
 
 
+def _resolve_eval_message_ablation_modes(cfg: RegionInterfaceConfig) -> list[str]:
+    if cfg.eval_all_message_ablations:
+        return list(_EVAL_MESSAGE_ABLATION_MODES)
+    if cfg.eval_message_ablation == "none":
+        return []
+    return [cfg.eval_message_ablation]
+
+
 def _evaluate_reference(
     *,
     cfg: RegionInterfaceConfig,
@@ -481,6 +509,39 @@ def _evaluate_reference(
                 device=device,
             )
             logits = model(xb)
+            losses.append(float(_next_token_loss(logits, yb).item()))
+    return {"ce_loss": float(sum(losses) / max(1, len(losses)))}
+
+
+def _evaluate_native(
+    *,
+    cfg: RegionInterfaceConfig,
+    model: NativeRegionInterfaceModel,
+    val_corpus: torch.Tensor,
+    eval_batches: int,
+    generator: torch.Generator,
+    device: torch.device,
+    message_ablation: str = "none",
+    ablation_generator: torch.Generator | None = None,
+) -> Dict[str, float]:
+    model.eval()
+    losses: list[float] = []
+    with torch.no_grad():
+        for _ in range(eval_batches):
+            xb, yb = _sample_batch_any(
+                cfg=cfg,
+                corpus=val_corpus,
+                batch_size=cfg.batch_size,
+                generator=generator,
+                device=device,
+            )
+            logits, _ = model.forward_with_cache(
+                xb,
+                message_ablation=message_ablation,
+                message_noise_std=cfg.message_noise_std,
+                message_mask_keep_prob=cfg.message_mask_keep_prob,
+                ablation_generator=ablation_generator,
+            )
             losses.append(float(_next_token_loss(logits, yb).item()))
     return {"ce_loss": float(sum(losses) / max(1, len(losses)))}
 
@@ -622,6 +683,7 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
     final_val = float("nan")
     best_val = float("inf")
     best_val_step = -1
+    final_eval_message_ablations: Dict[str, float] = {}
 
     for step in range(1, cfg.steps + 1):
         t0 = time.perf_counter()
@@ -752,12 +814,14 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
                 f.write(json.dumps(row, sort_keys=True) + "\n")
 
         if (step % cfg.eval_every) == 0 or step == cfg.steps:
-            val = _evaluate_reference(
+            eval_step_gen = torch.Generator(device=gen_device)
+            eval_step_gen.manual_seed(cfg.seed + 202 + (step * 11))
+            val = _evaluate_native(
                 cfg=cfg,
                 model=model,
                 val_corpus=val_corpus,
                 eval_batches=cfg.eval_batches,
-                generator=eval_gen,
+                generator=eval_step_gen,
                 device=device,
             )
             final_val = float(val["ce_loss"])
@@ -777,6 +841,36 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
             with metrics_jsonl.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(val_row, sort_keys=True) + "\n")
 
+            for ablation_idx, message_ablation in enumerate(_resolve_eval_message_ablation_modes(cfg)):
+                ablation_batch_gen = torch.Generator(device=gen_device)
+                ablation_batch_gen.manual_seed(cfg.seed + 202 + (step * 11))
+                eval_ablation_gen = torch.Generator(device=device)
+                eval_ablation_gen.manual_seed(cfg.seed + 303 + (step * 17) + ablation_idx)
+                ablated = _evaluate_native(
+                    cfg=cfg,
+                    model=model,
+                    val_corpus=val_corpus,
+                    eval_batches=cfg.eval_batches,
+                    generator=ablation_batch_gen,
+                    device=device,
+                    message_ablation=message_ablation,
+                    ablation_generator=eval_ablation_gen,
+                )
+                split_name = f"val_{message_ablation}"
+                final_eval_message_ablations[split_name] = float(ablated["ce_loss"])
+                ablation_row = {
+                    "step": step,
+                    "split": split_name,
+                    "ce_loss": float(ablated["ce_loss"]),
+                    "message_norm": "",
+                    "scan_align": "",
+                    "tokens_per_s": 0.0,
+                    "wall_time_s": 0.0,
+                }
+                _write_csv(metrics_csv, ablation_row)
+                with metrics_jsonl.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(ablation_row, sort_keys=True) + "\n")
+
     summary = {
         "regime": "native_region_interface",
         "task": cfg.task,
@@ -785,6 +879,7 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
         "final_val_ce_loss": final_val,
         "best_val_ce_loss": best_val,
         "best_val_step": best_val_step,
+        "final_eval_message_ablations": final_eval_message_ablations,
         "run_dir": str(run_dir),
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")

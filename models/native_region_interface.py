@@ -9,6 +9,7 @@ import torch.nn as nn
 from backbones.general import BackboneSpec, build_backbone_stack
 
 _INTERFACE_JACOBIAN_NOTICE = {"batched_vjp_fallback": False}
+_VALID_MESSAGE_ABLATIONS = {"none", "zero_all", "noise", "mask"}
 
 
 def _report_interface_jacobian_notice(kind: str, message: str) -> None:
@@ -96,10 +97,56 @@ class NativeRegionInterfaceModel(nn.Module):
     def _pool_hidden(self, x: torch.Tensor) -> torch.Tensor:
         return x.mean(dim=1)
 
-    def forward_with_cache(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, Dict[str, Any]]:
+    def _apply_message_ablation(
+        self,
+        m: torch.Tensor,
+        *,
+        mode: str,
+        next_region_idx: int,
+        noise_std: float,
+        mask_keep_prob: float,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        if mode not in _VALID_MESSAGE_ABLATIONS:
+            raise ValueError(f"unsupported message ablation mode: {mode}")
+        if mode == "none":
+            return m
+        if mode == "zero_all":
+            return torch.zeros_like(m)
+        if mode == "noise":
+            if noise_std < 0.0:
+                raise ValueError("message_noise_std must be >= 0")
+            if noise_std == 0.0:
+                return m
+            noise = torch.randn(m.shape, device=m.device, dtype=m.dtype, generator=generator)
+            return m + (noise_std * noise)
+        if mask_keep_prob <= 0.0 or mask_keep_prob > 1.0:
+            raise ValueError("message_mask_keep_prob must be in (0, 1]")
+        if mask_keep_prob == 1.0:
+            return m
+        mask = torch.rand(m.shape, device=m.device, generator=generator) < mask_keep_prob
+        return m * mask.to(dtype=m.dtype)
+
+    def forward_with_cache(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        message_ablation: str = "none",
+        message_noise_std: float = 1.0,
+        message_mask_keep_prob: float = 0.5,
+        ablation_generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, Dict[str, Any]]:
         x_static = self.embedding(input_ids)
         pooled0 = self._pool_hidden(x_static)
         m = self.input_to_message(pooled0)
+        m = self._apply_message_ablation(
+            m,
+            mode=message_ablation,
+            next_region_idx=0,
+            noise_std=message_noise_std,
+            mask_keep_prob=message_mask_keep_prob,
+            generator=ablation_generator,
+        )
 
         boundaries: List[torch.Tensor] = [x_static]
         region_hidden_inputs: List[torch.Tensor] = []
@@ -115,6 +162,14 @@ class NativeRegionInterfaceModel(nn.Module):
             delta_m = self.hidden_to_message[ridx](self._pool_hidden(x))
             alpha = torch.tanh(self.message_alpha[ridx])
             m = self.message_norm[ridx](m + alpha * delta_m)
+            m = self._apply_message_ablation(
+                m,
+                mode=message_ablation,
+                next_region_idx=ridx + 1,
+                noise_std=message_noise_std,
+                mask_keep_prob=message_mask_keep_prob,
+                generator=ablation_generator,
+            )
             region_messages.append(m)
 
         logits = self.lm_head(self.norm(x))
@@ -131,8 +186,22 @@ class NativeRegionInterfaceModel(nn.Module):
             "region_ranges": cache.region_ranges,
         }
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        logits, _ = self.forward_with_cache(input_ids)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        message_ablation: str = "none",
+        message_noise_std: float = 1.0,
+        message_mask_keep_prob: float = 0.5,
+        ablation_generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        logits, _ = self.forward_with_cache(
+            input_ids,
+            message_ablation=message_ablation,
+            message_noise_std=message_noise_std,
+            message_mask_keep_prob=message_mask_keep_prob,
+            ablation_generator=ablation_generator,
+        )
         return logits
 
     def interface_vjp_chain(self, cache: Dict[str, Any], g_top_message: torch.Tensor) -> List[torch.Tensor]:
