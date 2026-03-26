@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from backbones.general import BackboneSpec, build_backbone_stack
+from backbones.general import BackboneSpec, build_backbone_stack, _make_final_norm
 
 _INTERFACE_JACOBIAN_NOTICE = {"batched_vjp_fallback": False}
 _VALID_MESSAGE_ABLATIONS = {"none", "zero_all", "noise", "mask"}
@@ -81,7 +81,7 @@ class NativeRegionInterfaceModel(nn.Module):
         self.embedding = nn.Embedding(vocab_size, self.dim)
         self.backbone = build_backbone_stack(backbone_spec)
         self.blocks = self.backbone.blocks
-        self.norm = nn.LayerNorm(self.dim)
+        self.norm = _make_final_norm(backbone_spec)
         self.lm_head = nn.Linear(self.dim, vocab_size, bias=False)
 
         self.input_to_message = RegionMessageHead(self.dim, message_dim, hidden_dim=message_hidden_dim)
@@ -291,6 +291,23 @@ class NativeRegionInterfaceModel(nn.Module):
         suffix.append(eye.view(1, rank, rank).expand(bsz, rank, rank).clone())
         return suffix
 
+    def _apply_pullback_mat(
+        self,
+        mat: torch.Tensor,
+        vec: torch.Tensor,
+        *,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        compute_dtype = torch.promote_types(mat.dtype, vec.dtype)
+        result = torch.einsum(
+            "bij,bj->bi",
+            mat.to(dtype=compute_dtype),
+            vec.to(device=mat.device, dtype=compute_dtype),
+        )
+        if out_dtype is None:
+            out_dtype = vec.dtype
+        return result.to(device=vec.device, dtype=out_dtype)
+
     def interface_vjp_scan_from_mats(
         self,
         interface_pullback_mats: Sequence[torch.Tensor],
@@ -300,9 +317,12 @@ class NativeRegionInterfaceModel(nn.Module):
         suffix = self.compose_pullback_suffix(interface_pullback_mats)
         if len(suffix) != self.n_regions + 1:
             raise ValueError("suffix length mismatch.")
+        target_dtype = suffix[0].dtype
+        target_device = suffix[0].device
+        g_top_message = g_top_message.to(device=target_device, dtype=target_dtype)
         g_msgs: List[torch.Tensor] = []
         for ridx in range(self.n_regions):
-            g_msgs.append(torch.einsum("bij,bj->bi", suffix[ridx], g_top_message))
+            g_msgs.append(self._apply_pullback_mat(suffix[ridx], g_top_message, out_dtype=g_top_message.dtype))
         g_msgs.append(g_top_message)
         return g_msgs
 
@@ -328,6 +348,9 @@ class NativeRegionInterfaceModel(nn.Module):
         if self.n_regions == 1:
             return [g_last_input_message]
         mats = interface_pullback_mats[:-1]
+        target_dtype = interface_pullback_mats[0].dtype
+        target_device = interface_pullback_mats[0].device
+        g_last_input_message = g_last_input_message.to(device=target_device, dtype=target_dtype)
         bsz, rank, rank2 = mats[0].shape
         if rank != rank2:
             raise ValueError("interface pullback matrices must be square.")
@@ -341,4 +364,7 @@ class NativeRegionInterfaceModel(nn.Module):
         eye = torch.eye(rank, device=mats[0].device, dtype=mats[0].dtype)
         suffix: List[torch.Tensor] = [suffix_inclusive[:, ridx].contiguous() for ridx in range(self.n_regions - 1)]
         suffix.append(eye.view(1, rank, rank).expand(bsz, rank, rank).clone())
-        return [torch.einsum("bij,bj->bi", suffix[ridx], g_last_input_message) for ridx in range(self.n_regions)]
+        return [
+            self._apply_pullback_mat(suffix[ridx], g_last_input_message, out_dtype=g_last_input_message.dtype)
+            for ridx in range(self.n_regions)
+        ]

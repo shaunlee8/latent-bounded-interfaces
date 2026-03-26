@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import time
@@ -16,6 +17,7 @@ from backbones.general import BackboneSpec, ReferenceLM, infer_message_hidden_di
 from data.bpe_tokenizer import build_sentencepiece_bpe_stream, load_or_train_sentencepiece_bpe_tokenizer
 from data.data_paths import CORPORA_ROOT, TOKENIZERS_ROOT
 from data.lm_data import build_byte_stream, sample_batch_stream, split_stream_train_val
+from data.token_shards import TokenShardCorpus, corpus_numel, sample_batch_token_shards
 from data.train_data import build_synthetic_corpus, sample_batch
 from models.native_region_interface import NativeRegionInterfaceModel
 
@@ -24,6 +26,7 @@ _BUNDLED_TEXT_CORPORA: Dict[str, tuple[str, str]] = {
     "enwik8": ("enwik8_train.bin", "enwik8_val.bin"),
     "wikitext103_raw": ("wikitext103_raw_train.txt", "wikitext103_raw_val.txt"),
     "tinystories": ("tinystories_train.txt", "tinystories_val.txt"),
+    "fineweb_edu": ("fineweb_edu/fineweb_edu_train.txt", "fineweb_edu/fineweb_edu_val.txt"),
 }
 
 _EVAL_MESSAGE_ABLATION_MODES = ("zero_all", "noise", "mask")
@@ -39,12 +42,13 @@ class RegionInterfaceConfig:
     output_dir: str = "out/region_interface"
     run_name: str = ""
     task: str = "copy"
-    data_mode: str = "synthetic"  # synthetic | text_byte | text_bpe
+    data_mode: str = "synthetic"  # synthetic | text_byte | text_bpe | text_bpe_sharded
     text_corpus: str = "tiny_shakespeare"
     train_text_path: str = ""
     val_text_path: str = ""
     val_split: float = 0.1
     tokenizer_path: str = ""
+    token_shards_dir: str = ""
     train_tokenizer: bool = False
     tokenizer_train_bytes: int = 8 * 1024 * 1024
     vocab_size: int = 256
@@ -80,6 +84,9 @@ class RegionInterfaceConfig:
     message_noise_std: float = 1.0
     message_mask_keep_prob: float = 0.5
 
+    def __post_init__(self) -> None:
+        _validate_cfg(self)
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -101,6 +108,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--val-text-path", type=str, default="")
     p.add_argument("--val-split", type=float, default=0.1)
     p.add_argument("--tokenizer-path", type=str, default="")
+    p.add_argument("--token-shards-dir", type=str, default="")
     p.add_argument("--train-tokenizer", action="store_true")
     p.add_argument("--tokenizer-train-bytes", type=int, default=8 * 1024 * 1024)
     p.add_argument("--vocab-size", type=int, default=256)
@@ -141,8 +149,62 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _validate_cfg(cfg: RegionInterfaceConfig) -> None:
+    if cfg.regime not in {"native_region_interface", "all"}:
+        raise ValueError("regime must be one of: native_region_interface, all")
+    if cfg.backbone not in {"mamba1", "mamba2", "mamba3"}:
+        raise ValueError("backbone must be one of: mamba1, mamba2, mamba3")
+    if cfg.dtype not in {"float32", "bfloat16"}:
+        raise ValueError("dtype must be one of: float32, bfloat16")
+    if cfg.data_mode not in {"synthetic", "text_byte", "text_bpe", "text_bpe_sharded"}:
+        raise ValueError("data_mode must be one of: synthetic, text_byte, text_bpe, text_bpe_sharded")
+    if cfg.data_mode == "text_byte":
+        if cfg.vocab_size != 256:
+            raise ValueError("text_byte mode requires vocab_size=256")
+        if not (0.0 < cfg.val_split < 1.0):
+            raise ValueError("val_split must be in (0,1)")
+    if cfg.data_mode in {"text_bpe", "text_bpe_sharded"}:
+        if cfg.vocab_size <= 256:
+            raise ValueError(f"{cfg.data_mode} mode requires vocab_size > 256")
+        if cfg.data_mode == "text_bpe":
+            if cfg.tokenizer_train_bytes <= 0:
+                raise ValueError("tokenizer_train_bytes must be > 0")
+            if not (0.0 < cfg.val_split < 1.0):
+                raise ValueError("val_split must be in (0,1)")
+    if cfg.data_mode != "synthetic" and (not cfg.train_text_path) and cfg.text_corpus not in _BUNDLED_TEXT_CORPORA:
+        allowed = ", ".join(sorted(_BUNDLED_TEXT_CORPORA.keys()))
+        raise ValueError(f"text_corpus must be one of: {allowed} when train_text_path is not set")
+    if cfg.text_corpus == "fineweb_edu" and cfg.data_mode != "text_bpe_sharded":
+        raise ValueError("fineweb_edu currently requires data_mode=text_bpe_sharded")
+    if cfg.region_size <= 0:
+        raise ValueError("region_size must be > 0.")
+    if cfg.message_dim <= 0:
+        raise ValueError("message_dim must be > 0.")
+    if cfg.message_hidden_dim < 0:
+        raise ValueError("message_hidden_dim must be >= 0.")
+    if cfg.message_scale_init <= 0.0:
+        raise ValueError("message_scale_init must be > 0.")
+    if cfg.eval_message_ablation not in {"none", *_EVAL_MESSAGE_ABLATION_MODES}:
+        raise ValueError("eval_message_ablation must be one of: none, zero_all, noise, mask")
+    if cfg.message_noise_std < 0.0:
+        raise ValueError("message_noise_std must be >= 0.")
+    if cfg.message_mask_keep_prob <= 0.0 or cfg.message_mask_keep_prob > 1.0:
+        raise ValueError("message_mask_keep_prob must be in (0, 1].")
+    if cfg.backbone == "mamba3":
+        if cfg.dtype != "bfloat16":
+            raise ValueError("mamba3 currently requires dtype=bfloat16")
+        if cfg.device == "cpu":
+            raise ValueError("mamba3 currently requires CUDA")
+        if cfg.d_state < 16:
+            raise ValueError("mamba3 currently requires d_state >= 16")
+        if cfg.headdim < 16:
+            raise ValueError("mamba3 currently requires headdim >= 16")
+        if cfg.chunk_size < 16:
+            raise ValueError("mamba3 currently requires chunk_size >= 16")
+
+
 def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
-    cfg = RegionInterfaceConfig(
+    return RegionInterfaceConfig(
         regime=args.regime,
         backbone=args.backbone,
         seed=args.seed,
@@ -157,6 +219,7 @@ def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
         val_text_path=args.val_text_path,
         val_split=args.val_split,
         tokenizer_path=args.tokenizer_path,
+        token_shards_dir=args.token_shards_dir,
         train_tokenizer=args.train_tokenizer,
         tokenizer_train_bytes=args.tokenizer_train_bytes,
         vocab_size=args.vocab_size,
@@ -192,44 +255,6 @@ def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
         message_noise_std=args.message_noise_std,
         message_mask_keep_prob=args.message_mask_keep_prob,
     )
-    if cfg.regime not in {"native_region_interface", "all"}:
-        raise ValueError("regime must be one of: native_region_interface, all")
-    if cfg.backbone not in {"mamba1", "mamba2", "mamba3"}:
-        raise ValueError("backbone must be one of: mamba1, mamba2, mamba3")
-    if cfg.dtype != "float32":
-        raise ValueError("Only float32 is supported in this scaffold.")
-    if cfg.data_mode not in {"synthetic", "text_byte", "text_bpe"}:
-        raise ValueError("data_mode must be one of: synthetic, text_byte, text_bpe")
-    if cfg.data_mode == "text_byte":
-        if cfg.vocab_size != 256:
-            raise ValueError("text_byte mode requires vocab_size=256")
-        if not (0.0 < cfg.val_split < 1.0):
-            raise ValueError("val_split must be in (0,1)")
-    if cfg.data_mode == "text_bpe":
-        if cfg.vocab_size <= 256:
-            raise ValueError("text_bpe mode requires vocab_size > 256")
-        if cfg.tokenizer_train_bytes <= 0:
-            raise ValueError("tokenizer_train_bytes must be > 0")
-        if not (0.0 < cfg.val_split < 1.0):
-            raise ValueError("val_split must be in (0,1)")
-    if cfg.data_mode != "synthetic" and (not cfg.train_text_path) and cfg.text_corpus not in _BUNDLED_TEXT_CORPORA:
-        allowed = ", ".join(sorted(_BUNDLED_TEXT_CORPORA.keys()))
-        raise ValueError(f"text_corpus must be one of: {allowed} when train_text_path is not set")
-    if cfg.region_size <= 0:
-        raise ValueError("region_size must be > 0.")
-    if cfg.message_dim <= 0:
-        raise ValueError("message_dim must be > 0.")
-    if cfg.message_hidden_dim < 0:
-        raise ValueError("message_hidden_dim must be >= 0.")
-    if cfg.message_scale_init <= 0.0:
-        raise ValueError("message_scale_init must be > 0.")
-    if cfg.eval_message_ablation not in {"none", *_EVAL_MESSAGE_ABLATION_MODES}:
-        raise ValueError("eval_message_ablation must be one of: none, zero_all, noise, mask")
-    if cfg.message_noise_std < 0.0:
-        raise ValueError("message_noise_std must be >= 0.")
-    if cfg.message_mask_keep_prob <= 0.0 or cfg.message_mask_keep_prob > 1.0:
-        raise ValueError("message_mask_keep_prob must be in (0, 1].")
-    return cfg
 
 
 def _make_backbone_spec(cfg: RegionInterfaceConfig) -> BackboneSpec:
@@ -262,9 +287,18 @@ def _resolve_device(cfg: RegionInterfaceConfig) -> torch.device:
     return torch.device("cpu")
 
 
+
+
+def _autocast_context(cfg: RegionInterfaceConfig, device: torch.device):
+    if cfg.dtype == "bfloat16":
+        if device.type != "cuda":
+            raise RuntimeError("bfloat16 currently requires CUDA")
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
 def _next_token_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     vocab = logits.size(-1)
-    return F.cross_entropy(logits.reshape(-1, vocab), targets.reshape(-1), reduction="mean")
+    return F.cross_entropy(logits.float().reshape(-1, vocab), targets.reshape(-1), reduction="mean")
 
 
 def _resolve_text_paths(cfg: RegionInterfaceConfig) -> tuple[Path, Path | None, Path]:
@@ -293,11 +327,24 @@ def _resolve_tokenizer_path(cfg: RegionInterfaceConfig, *, train_path: Path) -> 
     return train_path.parent / "tokenizers" / f"{train_path.stem}_sp_bpe_{cfg.vocab_size}.model"
 
 
+def _resolve_token_shards_dir(cfg: RegionInterfaceConfig, *, train_path: Path) -> Path:
+    if cfg.token_shards_dir:
+        return Path(cfg.token_shards_dir)
+    if not cfg.train_text_path:
+        return CORPORA_ROOT / cfg.text_corpus / "tokens" / f"{cfg.text_corpus}_sp_bpe_{cfg.vocab_size}"
+    return train_path.parent / "tokens" / f"{train_path.stem}_sp_bpe_{cfg.vocab_size}"
+
+
+def _resolve_token_shard_manifests(cfg: RegionInterfaceConfig, *, train_path: Path) -> tuple[Path, Path]:
+    shard_dir = _resolve_token_shards_dir(cfg, train_path=train_path)
+    return shard_dir / "train_manifest.json", shard_dir / "val_manifest.json"
+
+
 def _build_corpora(
     cfg: RegionInterfaceConfig,
     *,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor | TokenShardCorpus, torch.Tensor | TokenShardCorpus]:
     if cfg.data_mode == "synthetic":
         train_corpus = build_synthetic_corpus(
             num_sequences=cfg.train_sequences,
@@ -328,6 +375,20 @@ def _build_corpora(
             return train_stream, val_stream
         return split_stream_train_val(train_stream, val_fraction=cfg.val_split)
 
+    if cfg.data_mode == "text_bpe_sharded":
+        train_manifest, val_manifest = _resolve_token_shard_manifests(cfg, train_path=train_path)
+        if not train_manifest.exists():
+            raise FileNotFoundError(
+                f"token shard manifest missing: {train_manifest}. "
+                f"Run: python -m data.pretokenize_corpus --text-corpus {cfg.text_corpus} --vocab-size {cfg.vocab_size}"
+            )
+        if not val_manifest.exists():
+            raise FileNotFoundError(
+                f"token shard manifest missing: {val_manifest}. "
+                f"Run: python -m data.pretokenize_corpus --text-corpus {cfg.text_corpus} --vocab-size {cfg.vocab_size}"
+            )
+        return TokenShardCorpus(train_manifest), TokenShardCorpus(val_manifest)
+
     tokenizer_path = _resolve_tokenizer_path(cfg, train_path=train_path)
     tokenizer = load_or_train_sentencepiece_bpe_tokenizer(
         tokenizer_path=tokenizer_path,
@@ -349,13 +410,21 @@ def _build_corpora(
 def _sample_batch_any(
     *,
     cfg: RegionInterfaceConfig,
-    corpus: torch.Tensor,
+    corpus: torch.Tensor | TokenShardCorpus,
     batch_size: int,
     generator: torch.Generator,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if cfg.data_mode == "synthetic":
         return sample_batch(corpus, batch_size=batch_size, generator=generator, device=device)
+    if cfg.data_mode == "text_bpe_sharded":
+        return sample_batch_token_shards(
+            corpus,
+            batch_size=batch_size,
+            seq_len=cfg.seq_len,
+            generator=generator,
+            device=device,
+        )
     return sample_batch_stream(
         corpus,
         batch_size=batch_size,
@@ -369,14 +438,19 @@ def _count_parameters(module: nn.Module) -> int:
     return int(sum(p.numel() for p in module.parameters()))
 
 
-def _infer_data_info(cfg: RegionInterfaceConfig, *, train_corpus: torch.Tensor, val_corpus: torch.Tensor) -> Dict[str, Any]:
+def _infer_data_info(
+    cfg: RegionInterfaceConfig,
+    *,
+    train_corpus: torch.Tensor | TokenShardCorpus,
+    val_corpus: torch.Tensor | TokenShardCorpus,
+) -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "data_mode": cfg.data_mode,
         "text_corpus": cfg.text_corpus,
         "vocab_size": int(cfg.vocab_size),
         "seq_len": int(cfg.seq_len),
-        "train_stream_length": int(train_corpus.numel()),
-        "val_stream_length": int(val_corpus.numel()),
+        "train_stream_length": corpus_numel(train_corpus),
+        "val_stream_length": corpus_numel(val_corpus),
     }
     if cfg.data_mode == "synthetic":
         info["task"] = cfg.task
@@ -390,14 +464,22 @@ def _infer_data_info(cfg: RegionInterfaceConfig, *, train_corpus: torch.Tensor, 
     info["val_path"] = str(val_path) if val_path is not None else ""
     info["train_file_bytes"] = int(train_path.stat().st_size) if train_path.exists() else 0
     info["val_file_bytes"] = int(val_path.stat().st_size) if (val_path is not None and val_path.exists()) else 0
-    if cfg.data_mode == "text_bpe":
+    if cfg.data_mode in {"text_bpe", "text_bpe_sharded"}:
         tokenizer_path = _resolve_tokenizer_path(cfg, train_path=train_path)
         vocab_path = tokenizer_path.with_suffix(".vocab")
         info["tokenizer_path"] = str(tokenizer_path)
         info["tokenizer_exists"] = bool(tokenizer_path.exists())
-        info["tokenizer_train_bytes"] = int(cfg.tokenizer_train_bytes)
         info["tokenizer_vocab_path"] = str(vocab_path)
         info["tokenizer_vocab_exists"] = bool(vocab_path.exists())
+    if cfg.data_mode == "text_bpe":
+        info["tokenizer_train_bytes"] = int(cfg.tokenizer_train_bytes)
+    if cfg.data_mode == "text_bpe_sharded":
+        train_manifest, val_manifest = _resolve_token_shard_manifests(cfg, train_path=train_path)
+        info["token_shards_dir"] = str(_resolve_token_shards_dir(cfg, train_path=train_path))
+        info["train_manifest"] = str(train_manifest)
+        info["train_manifest_exists"] = bool(train_manifest.exists())
+        info["val_manifest"] = str(val_manifest)
+        info["val_manifest_exists"] = bool(val_manifest.exists())
     return info
 
 
@@ -439,8 +521,8 @@ def _write_run_metadata(
     cfg: RegionInterfaceConfig,
     run_dir: Path,
     model: nn.Module,
-    train_corpus: torch.Tensor,
-    val_corpus: torch.Tensor,
+    train_corpus: torch.Tensor | TokenShardCorpus,
+    val_corpus: torch.Tensor | TokenShardCorpus,
 ) -> None:
     (run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
     (run_dir / "data_info.json").write_text(
@@ -492,7 +574,7 @@ def _evaluate_reference(
     *,
     cfg: RegionInterfaceConfig,
     model: nn.Module,
-    val_corpus: torch.Tensor,
+    val_corpus: torch.Tensor | TokenShardCorpus,
     eval_batches: int,
     generator: torch.Generator,
     device: torch.device,
@@ -508,7 +590,8 @@ def _evaluate_reference(
                 generator=generator,
                 device=device,
             )
-            logits = model(xb)
+            with _autocast_context(cfg, device):
+                logits = model(xb)
             losses.append(float(_next_token_loss(logits, yb).item()))
     return {"ce_loss": float(sum(losses) / max(1, len(losses)))}
 
@@ -517,7 +600,7 @@ def _evaluate_native(
     *,
     cfg: RegionInterfaceConfig,
     model: NativeRegionInterfaceModel,
-    val_corpus: torch.Tensor,
+    val_corpus: torch.Tensor | TokenShardCorpus,
     eval_batches: int,
     generator: torch.Generator,
     device: torch.device,
@@ -535,13 +618,14 @@ def _evaluate_native(
                 generator=generator,
                 device=device,
             )
-            logits, _ = model.forward_with_cache(
-                xb,
-                message_ablation=message_ablation,
-                message_noise_std=cfg.message_noise_std,
-                message_mask_keep_prob=cfg.message_mask_keep_prob,
-                ablation_generator=ablation_generator,
-            )
+            with _autocast_context(cfg, device):
+                logits, _ = model.forward_with_cache(
+                    xb,
+                    message_ablation=message_ablation,
+                    message_noise_std=cfg.message_noise_std,
+                    message_mask_keep_prob=cfg.message_mask_keep_prob,
+                    ablation_generator=ablation_generator,
+                )
             losses.append(float(_next_token_loss(logits, yb).item()))
     return {"ce_loss": float(sum(losses) / max(1, len(losses)))}
 
@@ -558,9 +642,7 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
     if device.type == "cuda":
         torch.cuda.manual_seed_all(cfg.seed)
 
-    model = ReferenceLM(vocab_size=cfg.vocab_size, backbone_spec=_make_backbone_spec(cfg)).to(
-        device=device, dtype=torch.float32
-    )
+    model = ReferenceLM(vocab_size=cfg.vocab_size, backbone_spec=_make_backbone_spec(cfg)).to(device=device, dtype=torch.float32)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr_model, weight_decay=cfg.weight_decay)
     train_corpus, val_corpus = _build_corpora(cfg, device=device)
     _write_run_metadata(cfg=cfg, run_dir=run_dir, model=model, train_corpus=train_corpus, val_corpus=val_corpus)
@@ -588,7 +670,8 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
             generator=train_gen,
             device=device,
         )
-        logits = model(xb)
+        with _autocast_context(cfg, device):
+            logits = model(xb)
         ce_loss = _next_token_loss(logits, yb)
         optimizer.zero_grad(set_to_none=True)
         ce_loss.backward()
@@ -695,7 +778,8 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
             generator=train_gen,
             device=device,
         )
-        logits, cache = model.forward_with_cache(xb)
+        with _autocast_context(cfg, device):
+            logits, cache = model.forward_with_cache(xb)
         ce_loss = _next_token_loss(logits, yb)
         optimizer.zero_grad(set_to_none=True)
 
@@ -723,7 +807,7 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
                     retain_graph=True,
                     create_graph=False,
                     allow_unused=False,
-                )[0].detach()
+                )[0].detach().to(device=region_messages[0].device, dtype=region_messages[0].dtype)
             ]
             interface_scan_rms = 0.0
         else:
@@ -735,11 +819,12 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
                 allow_unused=False,
             )[0].detach()
             mats = model.materialize_interface_pullback_mats(cache)
+            g_last_input = g_last_input.to(device=mats[0].device, dtype=mats[0].dtype)
             g_msg_inputs = model.interface_vjp_scan_from_last_input_seed(mats, g_last_input)
             g_manual = [torch.zeros_like(g_last_input) for _ in range(n_regions)]
             g_manual[-1] = g_last_input
             for ridx in reversed(range(n_regions - 1)):
-                g_manual[ridx] = torch.einsum("bij,bj->bi", mats[ridx], g_manual[ridx + 1])
+                g_manual[ridx] = model._apply_pullback_mat(mats[ridx], g_manual[ridx + 1], out_dtype=g_manual[ridx + 1].dtype)
             diffs = [((a - b) ** 2).mean() for a, b in zip(g_msg_inputs, g_manual)]
             interface_scan_rms = float(torch.sqrt(torch.stack(diffs).mean()).item())
 
