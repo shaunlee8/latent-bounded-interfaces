@@ -1,0 +1,39 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Native build artifacts
+*.so
+*.dylib
+*.dll
+build/
+dist/
+*.egg-info/
+cuda/build/
+rscan_cuda*.so
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Run outputs and generated plots
+out/
+plots/*.png
+plots/*.pdf
+plots/*.svg
+
+# Logs and crash dumps
+*.log
+core
+core.*
+
+# Local environments and editor clutter
+.env
+.venv/
+venv/
+.DS_Store
