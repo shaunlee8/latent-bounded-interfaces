@@ -48,6 +48,8 @@ class RegionInterfaceConfig:
     dtype: str = "float32"
     output_dir: str = "out/region_interface"
     run_name: str = ""
+    resume_from: str = ""
+    init_from: str = ""
     task: str = "copy"
     data_mode: str = "synthetic"  # synthetic | text_byte | text_bpe | text_bpe_sharded
     text_corpus: str = "tiny_shakespeare"
@@ -121,6 +123,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", type=str, default="float32")
     p.add_argument("--output-dir", type=str, default="out/region_interface")
     p.add_argument("--run-name", type=str, default="")
+    p.add_argument("--resume-from", type=str, default="")
+    p.add_argument("--init-from", type=str, default="")
     p.add_argument("--task", type=str, default="copy")
     p.add_argument("--data-mode", type=str, default="synthetic")
     p.add_argument("--text-corpus", type=str, default="tiny_shakespeare")
@@ -196,6 +200,8 @@ def _validate_cfg(cfg: RegionInterfaceConfig) -> None:
         raise ValueError("hybrid backbone requires --layer-types")
     if cfg.dtype not in {"float32", "bfloat16"}:
         raise ValueError("dtype must be one of: float32, bfloat16")
+    if cfg.resume_from and cfg.init_from:
+        raise ValueError("resume_from and init_from are mutually exclusive")
     if cfg.data_mode not in {"synthetic", "text_byte", "text_bpe", "text_bpe_sharded"}:
         raise ValueError("data_mode must be one of: synthetic, text_byte, text_bpe, text_bpe_sharded")
     if cfg.data_mode == "text_byte":
@@ -271,6 +277,8 @@ def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
         dtype=args.dtype,
         output_dir=args.output_dir,
         run_name=args.run_name,
+        resume_from=args.resume_from,
+        init_from=args.init_from,
         task=args.task,
         data_mode=args.data_mode,
         text_corpus=args.text_corpus,
@@ -684,22 +692,151 @@ def _save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     cfg: RegionInterfaceConfig,
+    device: torch.device,
+    train_generator: torch.Generator,
+    eval_generator: torch.Generator,
     step: int,
     tokens_seen: int,
+    best_val_ce_loss: float,
+    best_val_step: int,
     extra: Dict[str, Any] | None = None,
 ) -> Path:
     payload: Dict[str, Any] = {
         "step": int(step),
         "tokens_seen": int(tokens_seen),
+        "best_val_ce_loss": float(best_val_ce_loss),
+        "best_val_step": int(best_val_step),
         "config": cfg.to_dict(),
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
+        "train_generator_state": train_generator.get_state(),
+        "eval_generator_state": eval_generator.get_state(),
     }
     if extra:
         payload.update(extra)
     path = _checkpoint_dir(run_dir) / filename
     torch.save(payload, path)
     return path
+
+
+def _load_checkpoint(path: Path, *, device: torch.device) -> Dict[str, Any]:
+    return torch.load(path, map_location=device)
+
+
+def _resolve_checkpoint_path(
+    load_from: str,
+    *,
+    regime: str,
+    preference: str,
+) -> Path | None:
+    if not load_from:
+        return None
+    source = Path(load_from).expanduser()
+    if not source.exists():
+        raise FileNotFoundError(f"checkpoint source does not exist: {source}")
+    if source.is_file():
+        return source
+
+    candidates: list[Path] = []
+    preferred_name = "latest.pt" if preference == "latest" else "best.pt"
+    fallback_name = "best.pt" if preference == "latest" else "latest.pt"
+    if (source / "metrics.csv").exists():
+        candidates.extend(
+            [
+                source / "checkpoints" / preferred_name,
+                source / "checkpoints" / fallback_name,
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                source / regime / "checkpoints" / preferred_name,
+                source / regime / "checkpoints" / fallback_name,
+                source / "checkpoints" / preferred_name,
+                source / "checkpoints" / fallback_name,
+            ]
+        )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _infer_existing_root_dir(load_from: str) -> Path:
+    source = Path(load_from).expanduser().resolve()
+    if not source.exists():
+        raise FileNotFoundError(f"checkpoint source does not exist: {source}")
+    if source.is_file():
+        if source.parent.name == "checkpoints":
+            return source.parent.parent.parent
+        return source.parent
+    if (source / "metrics.csv").exists():
+        return source.parent
+    if (source / "checkpoints").exists():
+        return source.parent
+    return source
+
+
+def _maybe_restore_training_state(
+    *,
+    mode: str,
+    load_from: str,
+    regime: str,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    train_generator: torch.Generator,
+    eval_generator: torch.Generator,
+) -> Dict[str, Any]:
+    if mode not in {"resume", "init"}:
+        raise ValueError("mode must be one of: resume, init")
+    checkpoint_path = _resolve_checkpoint_path(
+        load_from,
+        regime=regime,
+        preference="latest" if mode == "resume" else "best",
+    )
+    if checkpoint_path is None:
+        return {
+            "checkpoint_path": "",
+            "start_step": 0,
+            "tokens_seen": 0,
+            "best_val_ce_loss": float("inf"),
+            "best_val_step": -1,
+        }
+
+    checkpoint = _load_checkpoint(checkpoint_path, device=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    if mode == "resume":
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        torch_rng_state = checkpoint.get("torch_rng_state")
+        if torch_rng_state is not None:
+            torch.set_rng_state(torch_rng_state.cpu())
+        if device.type == "cuda":
+            cuda_rng_state_all = checkpoint.get("cuda_rng_state_all")
+            if cuda_rng_state_all:
+                torch.cuda.set_rng_state_all([state.cpu() for state in cuda_rng_state_all])
+        train_gen_state = checkpoint.get("train_generator_state")
+        if train_gen_state is not None:
+            train_generator.set_state(train_gen_state.cpu())
+        eval_gen_state = checkpoint.get("eval_generator_state")
+        if eval_gen_state is not None:
+            eval_generator.set_state(eval_gen_state.cpu())
+        return {
+            "checkpoint_path": str(checkpoint_path),
+            "start_step": int(checkpoint.get("step", 0)),
+            "tokens_seen": int(checkpoint.get("tokens_seen", 0)),
+            "best_val_ce_loss": float(checkpoint.get("best_val_ce_loss", float("inf"))),
+            "best_val_step": int(checkpoint.get("best_val_step", -1)),
+        }
+    return {
+        "checkpoint_path": str(checkpoint_path),
+        "start_step": 0,
+        "tokens_seen": 0,
+        "best_val_ce_loss": float("inf"),
+        "best_val_step": -1,
+    }
 
 
 def _prepare_run_dir(cfg: RegionInterfaceConfig, regime_root: str) -> Path:
@@ -941,19 +1078,32 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
     train_gen.manual_seed(cfg.seed + 101)
     eval_gen = torch.Generator(device=gen_device)
     eval_gen.manual_seed(cfg.seed + 202)
+    restore = _maybe_restore_training_state(
+        mode="resume" if cfg.resume_from else "init",
+        load_from=cfg.resume_from or cfg.init_from,
+        regime="backprop_ref",
+        model=model,
+        optimizer=optimizer,
+        device=device,
+        train_generator=train_gen,
+        eval_generator=eval_gen,
+    )
 
     metrics_csv = run_dir / "metrics.csv"
     metrics_jsonl = run_dir / "metrics.jsonl"
     final_train = float("nan")
     final_val = float("nan")
-    best_val = float("inf")
-    best_val_step = -1
+    best_val = float(restore["best_val_ce_loss"])
+    best_val_step = int(restore["best_val_step"])
     best_checkpoint_path = ""
     latest_checkpoint_path = ""
     train_tokens_per_step = int(cfg.batch_size * cfg.seq_len)
-    total_train_tokens = 0
+    total_train_tokens = int(restore["tokens_seen"])
+    start_step = int(restore["start_step"])
+    resumed_from = str(restore["checkpoint_path"]) if cfg.resume_from else ""
+    initialized_from = str(restore["checkpoint_path"]) if cfg.init_from else ""
 
-    for step in range(1, cfg.steps + 1):
+    for step in range(start_step + 1, cfg.steps + 1):
         t0 = time.perf_counter()
         model.train()
         xb, yb = _sample_batch_any(
@@ -989,28 +1139,6 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
             _write_csv(metrics_csv, row)
             with metrics_jsonl.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row, sort_keys=True) + "\n")
-        if (step % cfg.save_every) == 0 or step == cfg.steps:
-            _save_checkpoint(
-                run_dir=run_dir,
-                filename=f"step_{step:07d}.pt",
-                model=model,
-                optimizer=optimizer,
-                cfg=cfg,
-                step=step,
-                tokens_seen=total_train_tokens,
-                extra={"regime": "backprop_ref", "train_ce_loss": final_train},
-            )
-            latest_path = _save_checkpoint(
-                run_dir=run_dir,
-                filename="latest.pt",
-                model=model,
-                optimizer=optimizer,
-                cfg=cfg,
-                step=step,
-                tokens_seen=total_train_tokens,
-                extra={"regime": "backprop_ref", "train_ce_loss": final_train},
-            )
-            latest_checkpoint_path = str(latest_path)
 
         if (step % cfg.eval_every) == 0 or step == cfg.steps:
             val = _evaluate_reference(
@@ -1032,8 +1160,13 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
                         model=model,
                         optimizer=optimizer,
                         cfg=cfg,
+                        device=device,
+                        train_generator=train_gen,
+                        eval_generator=eval_gen,
                         step=step,
                         tokens_seen=total_train_tokens,
+                        best_val_ce_loss=best_val,
+                        best_val_step=best_val_step,
                         extra={
                             "regime": "backprop_ref",
                             "train_ce_loss": final_train,
@@ -1056,10 +1189,44 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
             with metrics_jsonl.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(val_row, sort_keys=True) + "\n")
 
+        if (step % cfg.save_every) == 0 or step == cfg.steps:
+            _save_checkpoint(
+                run_dir=run_dir,
+                filename=f"step_{step:07d}.pt",
+                model=model,
+                optimizer=optimizer,
+                cfg=cfg,
+                device=device,
+                train_generator=train_gen,
+                eval_generator=eval_gen,
+                step=step,
+                tokens_seen=total_train_tokens,
+                best_val_ce_loss=best_val,
+                best_val_step=best_val_step,
+                extra={"regime": "backprop_ref", "train_ce_loss": final_train},
+            )
+            latest_path = _save_checkpoint(
+                run_dir=run_dir,
+                filename="latest.pt",
+                model=model,
+                optimizer=optimizer,
+                cfg=cfg,
+                device=device,
+                train_generator=train_gen,
+                eval_generator=eval_gen,
+                step=step,
+                tokens_seen=total_train_tokens,
+                best_val_ce_loss=best_val,
+                best_val_step=best_val_step,
+                extra={"regime": "backprop_ref", "train_ce_loss": final_train},
+            )
+            latest_checkpoint_path = str(latest_path)
+
     summary = {
         "regime": "backprop_ref",
         "task": cfg.task,
         "steps": int(cfg.steps),
+        "start_step": start_step,
         "final_train_ce_loss": final_train,
         "final_val_ce_loss": final_val,
         "best_val_ce_loss": best_val,
@@ -1068,6 +1235,8 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
         "total_train_tokens": total_train_tokens,
         "best_checkpoint_path": best_checkpoint_path,
         "latest_checkpoint_path": latest_checkpoint_path,
+        "resumed_from": resumed_from,
+        "initialized_from": initialized_from,
         "run_dir": str(run_dir),
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -1098,20 +1267,33 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
     train_gen.manual_seed(cfg.seed + 101)
     eval_gen = torch.Generator(device=gen_device)
     eval_gen.manual_seed(cfg.seed + 202)
+    restore = _maybe_restore_training_state(
+        mode="resume" if cfg.resume_from else "init",
+        load_from=cfg.resume_from or cfg.init_from,
+        regime="native_region_interface",
+        model=model,
+        optimizer=optimizer,
+        device=device,
+        train_generator=train_gen,
+        eval_generator=eval_gen,
+    )
 
     metrics_csv = run_dir / "metrics.csv"
     metrics_jsonl = run_dir / "metrics.jsonl"
     final_train = float("nan")
     final_val = float("nan")
-    best_val = float("inf")
-    best_val_step = -1
+    best_val = float(restore["best_val_ce_loss"])
+    best_val_step = int(restore["best_val_step"])
     final_eval_message_ablations: Dict[str, float] = {}
     best_checkpoint_path = ""
     latest_checkpoint_path = ""
     train_tokens_per_step = int(cfg.batch_size * cfg.seq_len)
-    total_train_tokens = 0
+    total_train_tokens = int(restore["tokens_seen"])
+    start_step = int(restore["start_step"])
+    resumed_from = str(restore["checkpoint_path"]) if cfg.resume_from else ""
+    initialized_from = str(restore["checkpoint_path"]) if cfg.init_from else ""
 
-    for step in range(1, cfg.steps + 1):
+    for step in range(start_step + 1, cfg.steps + 1):
         t0 = time.perf_counter()
         model.train()
         xb, yb = _sample_batch_any(
@@ -1152,37 +1334,6 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
             _write_csv(metrics_csv, row)
             with metrics_jsonl.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row, sort_keys=True) + "\n")
-        if (step % cfg.save_every) == 0 or step == cfg.steps:
-            _save_checkpoint(
-                run_dir=run_dir,
-                filename=f"step_{step:07d}.pt",
-                model=model,
-                optimizer=optimizer,
-                cfg=cfg,
-                step=step,
-                tokens_seen=total_train_tokens,
-                extra={
-                    "regime": "native_region_interface",
-                    "train_ce_loss": final_train,
-                    "interface_scan_rms": interface_scan_rms,
-                },
-            )
-            latest_path = _save_checkpoint(
-                run_dir=run_dir,
-                filename="latest.pt",
-                model=model,
-                optimizer=optimizer,
-                cfg=cfg,
-                step=step,
-                tokens_seen=total_train_tokens,
-                extra={
-                    "regime": "native_region_interface",
-                    "train_ce_loss": final_train,
-                    "interface_scan_rms": interface_scan_rms,
-                },
-            )
-            latest_checkpoint_path = str(latest_path)
-
         if (step % cfg.eval_every) == 0 or step == cfg.steps:
             eval_step_gen = torch.Generator(device=gen_device)
             eval_step_gen.manual_seed(cfg.seed + 202 + (step * 11))
@@ -1205,8 +1356,13 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
                         model=model,
                         optimizer=optimizer,
                         cfg=cfg,
+                        device=device,
+                        train_generator=train_gen,
+                        eval_generator=eval_gen,
                         step=step,
                         tokens_seen=total_train_tokens,
+                        best_val_ce_loss=best_val,
+                        best_val_step=best_val_step,
                         extra={
                             "regime": "native_region_interface",
                             "train_ce_loss": final_train,
@@ -1261,10 +1417,52 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
                 with metrics_jsonl.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(ablation_row, sort_keys=True) + "\n")
 
+        if (step % cfg.save_every) == 0 or step == cfg.steps:
+            _save_checkpoint(
+                run_dir=run_dir,
+                filename=f"step_{step:07d}.pt",
+                model=model,
+                optimizer=optimizer,
+                cfg=cfg,
+                device=device,
+                train_generator=train_gen,
+                eval_generator=eval_gen,
+                step=step,
+                tokens_seen=total_train_tokens,
+                best_val_ce_loss=best_val,
+                best_val_step=best_val_step,
+                extra={
+                    "regime": "native_region_interface",
+                    "train_ce_loss": final_train,
+                    "interface_scan_rms": interface_scan_rms,
+                },
+            )
+            latest_path = _save_checkpoint(
+                run_dir=run_dir,
+                filename="latest.pt",
+                model=model,
+                optimizer=optimizer,
+                cfg=cfg,
+                device=device,
+                train_generator=train_gen,
+                eval_generator=eval_gen,
+                step=step,
+                tokens_seen=total_train_tokens,
+                best_val_ce_loss=best_val,
+                best_val_step=best_val_step,
+                extra={
+                    "regime": "native_region_interface",
+                    "train_ce_loss": final_train,
+                    "interface_scan_rms": interface_scan_rms,
+                },
+            )
+            latest_checkpoint_path = str(latest_path)
+
     summary = {
         "regime": "native_region_interface",
         "task": cfg.task,
         "steps": int(cfg.steps),
+        "start_step": start_step,
         "final_train_ce_loss": final_train,
         "final_val_ce_loss": final_val,
         "best_val_ce_loss": best_val,
@@ -1274,6 +1472,8 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
         "best_checkpoint_path": best_checkpoint_path,
         "latest_checkpoint_path": latest_checkpoint_path,
         "final_eval_message_ablations": final_eval_message_ablations,
+        "resumed_from": resumed_from,
+        "initialized_from": initialized_from,
         "run_dir": str(run_dir),
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -1283,7 +1483,8 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
 def run_training(cfg: RegionInterfaceConfig) -> Dict[str, Any]:
     cfg.vocab_size = _resolve_runtime_vocab_size(cfg)
     regimes = ["native_region_interface"]
-    root_dir = _prepare_run_dir(cfg, regime_root=cfg.regime)
+    root_dir = _infer_existing_root_dir(cfg.resume_from) if cfg.resume_from else _prepare_run_dir(cfg, regime_root=cfg.regime)
+    root_dir.mkdir(parents=True, exist_ok=True)
     runs = []
     if cfg.include_reference_run:
         ref_dir = root_dir / "backprop_ref"
