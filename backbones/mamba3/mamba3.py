@@ -1,14 +1,38 @@
 # Copyright (c) 2026, Dao AI Lab, Goombalab.
 
+from dataclasses import dataclass
 import math
+
 from einops import rearrange, repeat
 
 import torch
+from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
 
 from backbones.mamba3.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 from backbones.mamba3.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
+
+
+@dataclass
+class Mamba3ForwardCache:
+    input_u: Tensor
+    in_proj: Tensor
+    z: Tensor
+    x: Tensor
+    B: Tensor
+    C: Tensor
+    dd_dt: Tensor
+    dd_A: Tensor
+    trap: Tensor
+    angles: Tensor
+    ADT: Tensor
+    DT: Tensor
+    B_normed: Tensor
+    C_normed: Tensor
+    y_inner: Tensor
+    output: Tensor
+
 
 class Mamba3(nn.Module):
     def __init__(
@@ -119,7 +143,15 @@ class Mamba3(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False, **factory_kwargs)
 
 
-    def forward(self, u, seq_idx=None, cu_seqlens=None, inference_params=None):
+    def _forward_impl(
+        self,
+        u,
+        *,
+        seq_idx=None,
+        cu_seqlens=None,
+        inference_params=None,
+        return_cache: bool = False,
+    ):
         """
         u: (batch, seqlen, hidden_dim)
         Returns: same shape as u
@@ -164,7 +196,7 @@ class Mamba3(nn.Module):
         # Apply RMS Norm on B and C
         B = self.B_norm(B)
         C = self.C_norm(C)
-        
+
         # Apply Mamba-3 kernel
         if self.is_mimo:
             angles = angle_dt(angles, DT.transpose(-1, -2)) # (B, L, N, S)
@@ -229,10 +261,68 @@ class Mamba3(nn.Module):
             if self.is_outproj_norm:
                 z = rearrange(z, "b l h p -> b l (h p)")
                 y = self.norm(y, z)
-        
+
         out = self.out_proj(y.to(x.dtype))
-        return out
-    
+        if not return_cache:
+            return out
+        return out, Mamba3ForwardCache(
+            input_u=u,
+            in_proj=zxBCdtAtrap,
+            z=z,
+            x=x,
+            B=B,
+            C=C,
+            dd_dt=dd_dt,
+            dd_A=dd_A,
+            trap=trap,
+            angles=angles,
+            ADT=ADT,
+            DT=DT,
+            B_normed=B,
+            C_normed=C,
+            y_inner=y,
+            output=out,
+        )
+
+    def forward(self, u, seq_idx=None, cu_seqlens=None, inference_params=None):
+        return self._forward_impl(
+            u,
+            seq_idx=seq_idx,
+            cu_seqlens=cu_seqlens,
+            inference_params=inference_params,
+            return_cache=False,
+        )
+
+    def forward_with_cache(self, u, seq_idx=None, cu_seqlens=None, inference_params=None) -> tuple[Tensor, Mamba3ForwardCache]:
+        out, cache = self._forward_impl(
+            u,
+            seq_idx=seq_idx,
+            cu_seqlens=cu_seqlens,
+            inference_params=inference_params,
+            return_cache=True,
+        )
+        return out, cache
+
+    def input_pullback_matrix(self, cache: Mamba3ForwardCache, g_out: Tensor) -> Tensor:
+        if g_out.dim() != 4:
+            raise ValueError("g_out must have shape [B, P, L, D].")
+        bsz, basis, seqlen, d_model = g_out.shape
+        if cache.output.shape != (bsz, seqlen, d_model):
+            raise ValueError("g_out shape does not match cached mixer output.")
+        cols = []
+        for pidx in range(basis):
+            grad_out = g_out[:, pidx, :, :].to(device=cache.output.device, dtype=cache.output.dtype)
+            grad_in = torch.autograd.grad(
+                cache.output,
+                cache.input_u,
+                grad_outputs=grad_out,
+                retain_graph=pidx + 1 < basis,
+                create_graph=False,
+                allow_unused=False,
+            )[0]
+            cols.append(grad_in.unsqueeze(1))
+        return torch.cat(cols, dim=1).to(device=g_out.device, dtype=g_out.dtype)
+
 
     def _preprocess(self, A_proj, dd_dt, B, C, x, z, trap_proj, angle_proj):
         _A = -F.softplus(A_proj.to(torch.float32))

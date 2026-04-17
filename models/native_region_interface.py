@@ -6,7 +6,9 @@ from typing import Any, Dict, List, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from backbones.general import BackboneSpec, build_backbone_stack, _make_final_norm
+from cuda.interface import suffix_scan_pullbacks
+
+from backbones.general import BackboneSpec, build_backbone_stack, _make_final_norm, init_transformer_module
 
 _INTERFACE_JACOBIAN_NOTICE = {"batched_vjp_fallback": False}
 _VALID_MESSAGE_ABLATIONS = {"none", "zero_all", "noise", "mask"}
@@ -46,7 +48,26 @@ class RegionMessageHead(nn.Module):
             self.net = nn.Linear(in_dim, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        param = next(self.net.parameters(), None)
+        if param is not None and x.dtype != param.dtype:
+            x = x.to(dtype=param.dtype)
         return self.net(x)
+
+
+@dataclass
+class RegionForwardCache:
+    region_idx: int
+    region_range: Tuple[int, int]
+    x_static: torch.Tensor
+    message_in: torch.Tensor
+    hidden_bias: torch.Tensor
+    hidden_input: torch.Tensor
+    hidden_output: torch.Tensor
+    pooled_hidden: torch.Tensor
+    delta_message: torch.Tensor
+    alpha: torch.Tensor
+    pre_norm_message: torch.Tensor
+    message_out: torch.Tensor
 
 
 @dataclass
@@ -55,6 +76,7 @@ class RegionInterfaceCache:
     region_hidden_inputs: List[torch.Tensor]
     region_messages: List[torch.Tensor]
     region_ranges: List[Tuple[int, int]]
+    region_caches: List[RegionForwardCache]
 
 
 class NativeRegionInterfaceModel(nn.Module):
@@ -93,9 +115,22 @@ class NativeRegionInterfaceModel(nn.Module):
         )
         self.message_norm = nn.ModuleList([nn.LayerNorm(message_dim) for _ in range(self.n_regions)])
         self.message_alpha = nn.Parameter(torch.full((self.n_regions,), float(message_scale_init)))
+        if backbone_spec.name == "transformer":
+            init_transformer_module(self.embedding, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
+            init_transformer_module(self.backbone, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
+            init_transformer_module(self.lm_head, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
+        elif backbone_spec.name == "hybrid":
+            init_transformer_module(self.embedding, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
+            for layer_type, block in zip(backbone_spec.layer_types, self.blocks):
+                if layer_type == "transformer":
+                    init_transformer_module(block, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
+            init_transformer_module(self.lm_head, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
 
     def _pool_hidden(self, x: torch.Tensor) -> torch.Tensor:
-        return x.mean(dim=1)
+        pooled = x.mean(dim=1)
+        if pooled.dtype != x.dtype:
+            pooled = pooled.to(dtype=x.dtype)
+        return pooled
 
     def _apply_message_ablation(
         self,
@@ -151,17 +186,22 @@ class NativeRegionInterfaceModel(nn.Module):
         boundaries: List[torch.Tensor] = [x_static]
         region_hidden_inputs: List[torch.Tensor] = []
         region_messages: List[torch.Tensor] = [m]
+        region_caches: List[RegionForwardCache] = []
         for ridx, (start, end) in enumerate(self.region_ranges):
+            m_in = m
+            hidden_bias = self.message_to_hidden[ridx](m_in)
             # Strict bounded-interface mode: each region hidden stream is rebuilt
             # from static token embedding + current message, with no dense carry.
-            x = x_static + self.message_to_hidden[ridx](m).unsqueeze(1)
-            region_hidden_inputs.append(x)
-            x = self.backbone.forward_range(x, start, end)
-            boundaries.append(x)
+            x_in = x_static + hidden_bias.unsqueeze(1)
+            region_hidden_inputs.append(x_in)
+            x_out = self.backbone.forward_range(x_in, start, end)
+            boundaries.append(x_out)
 
-            delta_m = self.hidden_to_message[ridx](self._pool_hidden(x))
+            pooled_hidden = self._pool_hidden(x_out)
+            delta_m = self.hidden_to_message[ridx](pooled_hidden)
             alpha = torch.tanh(self.message_alpha[ridx])
-            m = self.message_norm[ridx](m + alpha * delta_m)
+            pre_norm_message = m_in + alpha * delta_m
+            m = self.message_norm[ridx](pre_norm_message)
             m = self._apply_message_ablation(
                 m,
                 mode=message_ablation,
@@ -171,19 +211,40 @@ class NativeRegionInterfaceModel(nn.Module):
                 generator=ablation_generator,
             )
             region_messages.append(m)
+            region_caches.append(
+                RegionForwardCache(
+                    region_idx=ridx,
+                    region_range=(start, end),
+                    x_static=x_static,
+                    message_in=m_in,
+                    hidden_bias=hidden_bias,
+                    hidden_input=x_in,
+                    hidden_output=x_out,
+                    pooled_hidden=pooled_hidden,
+                    delta_message=delta_m,
+                    alpha=alpha,
+                    pre_norm_message=pre_norm_message,
+                    message_out=m,
+                )
+            )
 
-        logits = self.lm_head(self.norm(x))
+        logits_in = self.norm(x_out)
+        if logits_in.dtype != self.lm_head.weight.dtype:
+            logits_in = logits_in.to(dtype=self.lm_head.weight.dtype)
+        logits = self.lm_head(logits_in)
         cache = RegionInterfaceCache(
             boundaries=boundaries,
             region_hidden_inputs=region_hidden_inputs,
             region_messages=region_messages,
             region_ranges=self.region_ranges,
+            region_caches=region_caches,
         )
         return logits, {
             "boundaries": cache.boundaries,
             "region_hidden_inputs": cache.region_hidden_inputs,
             "region_messages": cache.region_messages,
             "region_ranges": cache.region_ranges,
+            "region_caches": cache.region_caches,
         }
 
     def forward(
@@ -203,6 +264,153 @@ class NativeRegionInterfaceModel(nn.Module):
             ablation_generator=ablation_generator,
         )
         return logits
+
+    def _module_input_pullback_matrix_autograd(
+        self,
+        module: nn.Module,
+        x: torch.Tensor,
+        g_out: torch.Tensor,
+    ) -> torch.Tensor:
+        if x.dim() != 2:
+            raise ValueError("module input pullback expects x shaped [B, D].")
+        if g_out.dim() != 3:
+            raise ValueError("module input pullback expects g_out shaped [B, P, D_out].")
+        bsz, basis = g_out.shape[:2]
+        x_rep = (
+            x.detach()
+            .unsqueeze(1)
+            .expand(bsz, basis, x.shape[-1])
+            .reshape(bsz * basis, x.shape[-1])
+            .requires_grad_(True)
+        )
+        y_rep = module(x_rep)
+        g_rep = g_out.to(device=y_rep.device, dtype=y_rep.dtype).reshape_as(y_rep)
+        g_in = torch.autograd.grad(
+            y_rep,
+            x_rep,
+            grad_outputs=g_rep,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=False,
+        )[0]
+        return g_in.reshape(bsz, basis, x.shape[-1]).to(device=g_out.device, dtype=g_out.dtype)
+
+    def _linear_input_pullback_matrix(self, linear: nn.Linear, g_out: torch.Tensor) -> torch.Tensor:
+        if g_out.dim() != 3:
+            raise ValueError("linear pullback expects g_out shaped [B, P, D_out].")
+        compute_dtype = torch.promote_types(g_out.dtype, linear.weight.dtype)
+        g_in = torch.einsum(
+            "bpo,oi->bpi",
+            g_out.to(device=linear.weight.device, dtype=compute_dtype),
+            linear.weight.to(dtype=compute_dtype),
+        )
+        return g_in.to(device=g_out.device, dtype=g_out.dtype)
+
+    def _silu_input_pullback_matrix(self, x: torch.Tensor, g_out: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 2:
+            raise ValueError("SiLU pullback expects x shaped [B, D].")
+        if g_out.dim() != 3:
+            raise ValueError("SiLU pullback expects g_out shaped [B, P, D].")
+        compute_dtype = torch.promote_types(x.dtype, g_out.dtype)
+        x_compute = x.to(device=g_out.device, dtype=compute_dtype)
+        g_compute = g_out.to(dtype=compute_dtype)
+        sig = torch.sigmoid(x_compute)
+        deriv = sig * (1.0 + x_compute * (1.0 - sig))
+        return (g_compute * deriv.unsqueeze(1)).to(device=g_out.device, dtype=g_out.dtype)
+
+    def _region_message_head_input_pullback_matrix(
+        self,
+        head: RegionMessageHead,
+        x: torch.Tensor,
+        g_out: torch.Tensor,
+    ) -> torch.Tensor:
+        net = head.net
+        if isinstance(net, nn.Linear):
+            return self._linear_input_pullback_matrix(net, g_out)
+        if isinstance(net, nn.Sequential) and len(net) == 3:
+            linear1, act, linear2 = net
+            if not isinstance(linear1, nn.Linear) or not isinstance(act, nn.SiLU) or not isinstance(linear2, nn.Linear):
+                raise TypeError("unsupported RegionMessageHead sequential structure")
+            compute_dtype = torch.promote_types(x.dtype, g_out.dtype)
+            hidden_pre = linear1(x.to(device=linear1.weight.device, dtype=compute_dtype))
+            g_hidden = self._linear_input_pullback_matrix(linear2, g_out.to(device=linear2.weight.device, dtype=compute_dtype))
+            g_hidden = g_hidden.to(device=hidden_pre.device, dtype=hidden_pre.dtype)
+            g_hidden_pre = self._silu_input_pullback_matrix(hidden_pre, g_hidden)
+            g_in = self._linear_input_pullback_matrix(linear1, g_hidden_pre)
+            return g_in.to(device=g_out.device, dtype=g_out.dtype)
+        raise TypeError(f"unsupported RegionMessageHead net type: {type(net).__name__}")
+
+    def _mean_pool_pullback_matrix(self, g_pooled: torch.Tensor, seq_len: int) -> torch.Tensor:
+        if g_pooled.dim() != 3:
+            raise ValueError("mean-pool pullback expects g_pooled shaped [B, P, D].")
+        if seq_len <= 0:
+            raise ValueError("seq_len must be positive.")
+        return g_pooled.unsqueeze(2).expand(-1, -1, seq_len, -1) / float(seq_len)
+
+    def _broadcast_message_pullback_matrix(self, g_hidden_input: torch.Tensor) -> torch.Tensor:
+        if g_hidden_input.dim() != 4:
+            raise ValueError("broadcast pullback expects g_hidden_input shaped [B, P, L, D].")
+        return g_hidden_input.sum(dim=2)
+
+    def region_message_output_pullback_to_hidden_output(
+        self,
+        region_cache: RegionForwardCache,
+        g_message_out: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        if g_message_out.dim() != 3:
+            raise ValueError("g_message_out must have shape [B, P, R].")
+        g_pre_norm = self._module_input_pullback_matrix_autograd(
+            self.message_norm[region_cache.region_idx],
+            region_cache.pre_norm_message,
+            g_message_out,
+        )
+        g_message_skip = g_pre_norm
+        g_delta_message = g_pre_norm * region_cache.alpha.to(dtype=g_pre_norm.dtype).view(1, 1, 1)
+        g_pooled_hidden = self._region_message_head_input_pullback_matrix(
+            self.hidden_to_message[region_cache.region_idx],
+            region_cache.pooled_hidden,
+            g_delta_message,
+        )
+        g_hidden_output = self._mean_pool_pullback_matrix(g_pooled_hidden, seq_len=region_cache.hidden_output.shape[1])
+        return {
+            "g_pre_norm_message": g_pre_norm,
+            "g_message_skip": g_message_skip,
+            "g_delta_message": g_delta_message,
+            "g_pooled_hidden": g_pooled_hidden,
+            "g_hidden_output": g_hidden_output,
+        }
+
+    def region_hidden_input_pullback_to_message_input(
+        self,
+        region_cache: RegionForwardCache,
+        g_hidden_input: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        if g_hidden_input.dim() != 4:
+            raise ValueError("g_hidden_input must have shape [B, P, L, D].")
+        g_hidden_bias = self._broadcast_message_pullback_matrix(g_hidden_input)
+        g_message_input = self._region_message_head_input_pullback_matrix(
+            self.message_to_hidden[region_cache.region_idx],
+            region_cache.message_in,
+            g_hidden_bias,
+        )
+        return {
+            "g_hidden_bias": g_hidden_bias,
+            "g_message_input": g_message_input,
+        }
+
+    def region_outer_message_input_pullback(
+        self,
+        region_cache: RegionForwardCache,
+        g_message_out: torch.Tensor,
+        g_hidden_input: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        tail = self.region_message_output_pullback_to_hidden_output(region_cache, g_message_out)
+        head = self.region_hidden_input_pullback_to_message_input(region_cache, g_hidden_input)
+        return {
+            **tail,
+            **head,
+            "g_message_input_total": tail["g_message_skip"] + head["g_message_input"],
+        }
 
     def interface_vjp_chain(self, cache: Dict[str, Any], g_top_message: torch.Tensor) -> List[torch.Tensor]:
         """Reference region-message pullback chain (sequential over regions)."""
@@ -272,24 +480,17 @@ class NativeRegionInterfaceModel(nn.Module):
 
     def compose_pullback_suffix(self, interface_pullback_mats: Sequence[torch.Tensor]) -> List[torch.Tensor]:
         """Suffix products S_k = A_k^T ... A_{K-1}^T with S_K = I."""
-        if len(interface_pullback_mats) != self.n_regions:
-            raise ValueError("interface_pullback_mats length mismatch.")
-        if self.n_regions == 0:
+        count = len(interface_pullback_mats)
+        if count == 0:
             return []
         bsz, rank, rank2 = interface_pullback_mats[0].shape
         if rank != rank2:
             raise ValueError("interface pullback matrices must be square.")
-        eye = torch.eye(rank, device=interface_pullback_mats[0].device, dtype=interface_pullback_mats[0].dtype)
         mats = torch.stack(list(interface_pullback_mats), dim=1).contiguous()
-        suffix_inclusive = mats.clone()
-        offset = 1
-        while offset < self.n_regions:
-            prev = suffix_inclusive.clone()
-            suffix_inclusive[:, :-offset] = torch.matmul(prev[:, :-offset], prev[:, offset:])
-            offset *= 2
-        suffix = [suffix_inclusive[:, ridx].contiguous() for ridx in range(self.n_regions)]
-        suffix.append(eye.view(1, rank, rank).expand(bsz, rank, rank).clone())
-        return suffix
+        suffix = suffix_scan_pullbacks(mats)
+        if suffix.shape != (bsz, count + 1, rank, rank):
+            raise ValueError("suffix scan returned an unexpected shape")
+        return [suffix[:, ridx].contiguous() for ridx in range(count + 1)]
 
     def _apply_pullback_mat(
         self,
@@ -314,14 +515,15 @@ class NativeRegionInterfaceModel(nn.Module):
         g_top_message: torch.Tensor,
     ) -> List[torch.Tensor]:
         """Apply suffix-composed pullback summaries to top message gradient."""
+        count = len(interface_pullback_mats)
         suffix = self.compose_pullback_suffix(interface_pullback_mats)
-        if len(suffix) != self.n_regions + 1:
+        if len(suffix) != count + 1:
             raise ValueError("suffix length mismatch.")
         target_dtype = suffix[0].dtype
         target_device = suffix[0].device
         g_top_message = g_top_message.to(device=target_device, dtype=target_dtype)
         g_msgs: List[torch.Tensor] = []
-        for ridx in range(self.n_regions):
+        for ridx in range(count):
             g_msgs.append(self._apply_pullback_mat(suffix[ridx], g_top_message, out_dtype=g_top_message.dtype))
         g_msgs.append(g_top_message)
         return g_msgs
@@ -348,22 +550,10 @@ class NativeRegionInterfaceModel(nn.Module):
         if self.n_regions == 1:
             return [g_last_input_message]
         mats = interface_pullback_mats[:-1]
-        target_dtype = interface_pullback_mats[0].dtype
-        target_device = interface_pullback_mats[0].device
+        suffix = self.compose_pullback_suffix(mats)
+        target_dtype = suffix[0].dtype
+        target_device = suffix[0].device
         g_last_input_message = g_last_input_message.to(device=target_device, dtype=target_dtype)
-        bsz, rank, rank2 = mats[0].shape
-        if rank != rank2:
-            raise ValueError("interface pullback matrices must be square.")
-        mats_stacked = torch.stack(list(mats), dim=1).contiguous()
-        suffix_inclusive = mats_stacked.clone()
-        offset = 1
-        while offset < (self.n_regions - 1):
-            prev = suffix_inclusive.clone()
-            suffix_inclusive[:, : -(offset)] = torch.matmul(prev[:, : -(offset)], prev[:, offset:])
-            offset *= 2
-        eye = torch.eye(rank, device=mats[0].device, dtype=mats[0].dtype)
-        suffix: List[torch.Tensor] = [suffix_inclusive[:, ridx].contiguous() for ridx in range(self.n_regions - 1)]
-        suffix.append(eye.view(1, rank, rank).expand(bsz, rank, rank).clone())
         return [
             self._apply_pullback_mat(suffix[ridx], g_last_input_message, out_dtype=g_last_input_message.dtype)
             for ridx in range(self.n_regions)

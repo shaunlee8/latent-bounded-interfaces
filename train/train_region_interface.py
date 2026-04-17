@@ -14,8 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from backbones.general import BackboneSpec, ReferenceLM, infer_message_hidden_dim
-from data.bpe_tokenizer import build_sentencepiece_bpe_stream, load_or_train_sentencepiece_bpe_tokenizer
-from data.data_paths import CORPORA_ROOT, TOKENIZERS_ROOT
+from data.bpe_tokenizer import build_token_stream, load_text_tokenizer
+from data.data_paths import CORPORA_ROOT, LLAMA31_TOKENIZER_ROOT, TOKENIZERS_ROOT
 from data.lm_data import build_byte_stream, sample_batch_stream, split_stream_train_val
 from data.token_shards import TokenShardCorpus, corpus_numel, sample_batch_token_shards
 from data.train_data import build_synthetic_corpus, sample_batch
@@ -33,9 +33,16 @@ _EVAL_MESSAGE_ABLATION_MODES = ("zero_all", "noise", "mask")
 
 
 @dataclass
+class NativeBackwardResult:
+    grad_map: Dict[str, torch.Tensor | None]
+    interface_scan_rms: float
+
+
+@dataclass
 class RegionInterfaceConfig:
     regime: str = "all"  # native_region_interface | all
     backbone: str = "mamba1"
+    layer_types: str = ""
     seed: int = 7
     device: str = "auto"  # auto | cpu | cuda
     dtype: str = "float32"
@@ -48,6 +55,7 @@ class RegionInterfaceConfig:
     val_text_path: str = ""
     val_split: float = 0.1
     tokenizer_path: str = ""
+    tokenizer_type: str = "sentencepiece"
     token_shards_dir: str = ""
     train_tokenizer: bool = False
     tokenizer_train_bytes: int = 8 * 1024 * 1024
@@ -74,6 +82,17 @@ class RegionInterfaceConfig:
     ngroups: int = 1
     chunk_size: int = 256
     use_mem_eff_path: bool = True
+    n_heads: int = 8
+    n_kv_heads: int = 0
+    mlp_ratio: float = 4.0
+    d_intermediate: int = 0
+    rope_base: float = 10000.0
+    attn_head_dim: int = 0
+    softmax_scale: float = 0.0
+    rope_interleaved: bool = False
+    use_flash_attn: bool = True
+    residual_in_fp32: bool = True
+    fused_add_norm: bool = True
     include_reference_run: bool = True
     region_size: int = 2
     message_dim: int = 64
@@ -96,6 +115,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train bounded region interfaces on a dense Mamba backbone.")
     p.add_argument("--regime", type=str, default="all")
     p.add_argument("--backbone", type=str, default="mamba1")
+    p.add_argument("--layer-types", type=str, default="")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--dtype", type=str, default="float32")
@@ -108,6 +128,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--val-text-path", type=str, default="")
     p.add_argument("--val-split", type=float, default=0.1)
     p.add_argument("--tokenizer-path", type=str, default="")
+    p.add_argument("--tokenizer-type", type=str, default="sentencepiece")
     p.add_argument("--token-shards-dir", type=str, default="")
     p.add_argument("--train-tokenizer", action="store_true")
     p.add_argument("--tokenizer-train-bytes", type=int, default=8 * 1024 * 1024)
@@ -135,6 +156,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--chunk-size", type=int, default=256)
     p.add_argument("--no-mem-eff-path", dest="use_mem_eff_path", action="store_false")
     p.set_defaults(use_mem_eff_path=True)
+    p.add_argument("--n-heads", type=int, default=8)
+    p.add_argument("--n-kv-heads", type=int, default=0)
+    p.add_argument("--mlp-ratio", type=float, default=4.0)
+    p.add_argument("--d-intermediate", type=int, default=0)
+    p.add_argument("--rope-base", type=float, default=10000.0)
+    p.add_argument("--attn-head-dim", type=int, default=0)
+    p.add_argument("--softmax-scale", type=float, default=0.0)
+    p.add_argument("--rope-interleaved", action="store_true")
+    p.add_argument("--use-flash-attn", dest="use_flash_attn", action="store_true")
+    p.add_argument("--no-flash-attn", dest="use_flash_attn", action="store_false")
+    p.set_defaults(use_flash_attn=True)
+    p.add_argument("--residual-in-fp32", dest="residual_in_fp32", action="store_true")
+    p.add_argument("--no-residual-in-fp32", dest="residual_in_fp32", action="store_false")
+    p.set_defaults(residual_in_fp32=True)
+    p.add_argument("--fused-add-norm", dest="fused_add_norm", action="store_true")
+    p.add_argument("--no-fused-add-norm", dest="fused_add_norm", action="store_false")
+    p.set_defaults(fused_add_norm=True)
     p.add_argument("--include-reference-run", action="store_true")
     p.add_argument("--no-reference-run", dest="include_reference_run", action="store_false")
     p.set_defaults(include_reference_run=True)
@@ -152,8 +190,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def _validate_cfg(cfg: RegionInterfaceConfig) -> None:
     if cfg.regime not in {"native_region_interface", "all"}:
         raise ValueError("regime must be one of: native_region_interface, all")
-    if cfg.backbone not in {"mamba1", "mamba2", "mamba3"}:
-        raise ValueError("backbone must be one of: mamba1, mamba2, mamba3")
+    if cfg.backbone not in {"mamba1", "mamba2", "mamba3", "transformer", "hybrid"}:
+        raise ValueError("backbone must be one of: mamba1, mamba2, mamba3, transformer, hybrid")
+    if cfg.backbone == "hybrid" and not cfg.layer_types.strip():
+        raise ValueError("hybrid backbone requires --layer-types")
     if cfg.dtype not in {"float32", "bfloat16"}:
         raise ValueError("dtype must be one of: float32, bfloat16")
     if cfg.data_mode not in {"synthetic", "text_byte", "text_bpe", "text_bpe_sharded"}:
@@ -164,18 +204,34 @@ def _validate_cfg(cfg: RegionInterfaceConfig) -> None:
         if not (0.0 < cfg.val_split < 1.0):
             raise ValueError("val_split must be in (0,1)")
     if cfg.data_mode in {"text_bpe", "text_bpe_sharded"}:
-        if cfg.vocab_size <= 256:
+        if cfg.tokenizer_type not in {"sentencepiece", "llama31"}:
+            raise ValueError("tokenizer_type must be one of: sentencepiece, llama31")
+        if cfg.tokenizer_type == "sentencepiece" and cfg.vocab_size <= 256:
             raise ValueError(f"{cfg.data_mode} mode requires vocab_size > 256")
         if cfg.data_mode == "text_bpe":
-            if cfg.tokenizer_train_bytes <= 0:
+            if cfg.tokenizer_type == "sentencepiece" and cfg.tokenizer_train_bytes <= 0:
                 raise ValueError("tokenizer_train_bytes must be > 0")
             if not (0.0 < cfg.val_split < 1.0):
                 raise ValueError("val_split must be in (0,1)")
+        if cfg.tokenizer_type == "llama31" and cfg.train_tokenizer:
+            raise ValueError("llama31 tokenizer does not support --train-tokenizer")
     if cfg.data_mode != "synthetic" and (not cfg.train_text_path) and cfg.text_corpus not in _BUNDLED_TEXT_CORPORA:
         allowed = ", ".join(sorted(_BUNDLED_TEXT_CORPORA.keys()))
         raise ValueError(f"text_corpus must be one of: {allowed} when train_text_path is not set")
     if cfg.text_corpus == "fineweb_edu" and cfg.data_mode != "text_bpe_sharded":
         raise ValueError("fineweb_edu currently requires data_mode=text_bpe_sharded")
+    if cfg.seq_len <= 0:
+        raise ValueError("seq_len must be > 0")
+    if cfg.batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+    if cfg.steps <= 0:
+        raise ValueError("steps must be > 0")
+    if cfg.eval_every <= 0:
+        raise ValueError("eval_every must be > 0")
+    if cfg.log_every <= 0:
+        raise ValueError("log_every must be > 0")
+    if cfg.save_every <= 0:
+        raise ValueError("save_every must be > 0")
     if cfg.region_size <= 0:
         raise ValueError("region_size must be > 0.")
     if cfg.message_dim <= 0:
@@ -190,7 +246,9 @@ def _validate_cfg(cfg: RegionInterfaceConfig) -> None:
         raise ValueError("message_noise_std must be >= 0.")
     if cfg.message_mask_keep_prob <= 0.0 or cfg.message_mask_keep_prob > 1.0:
         raise ValueError("message_mask_keep_prob must be in (0, 1].")
-    if cfg.backbone == "mamba3":
+    hybrid_layer_types = tuple(t.strip() for t in cfg.layer_types.split(",") if t.strip()) if cfg.layer_types else ()
+    needs_mamba3_constraints = cfg.backbone == "mamba3" or (cfg.backbone == "hybrid" and "mamba3" in hybrid_layer_types)
+    if needs_mamba3_constraints:
         if cfg.dtype != "bfloat16":
             raise ValueError("mamba3 currently requires dtype=bfloat16")
         if cfg.device == "cpu":
@@ -207,6 +265,7 @@ def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
     return RegionInterfaceConfig(
         regime=args.regime,
         backbone=args.backbone,
+        layer_types=args.layer_types,
         seed=args.seed,
         device=args.device,
         dtype=args.dtype,
@@ -219,6 +278,7 @@ def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
         val_text_path=args.val_text_path,
         val_split=args.val_split,
         tokenizer_path=args.tokenizer_path,
+        tokenizer_type=args.tokenizer_type,
         token_shards_dir=args.token_shards_dir,
         train_tokenizer=args.train_tokenizer,
         tokenizer_train_bytes=args.tokenizer_train_bytes,
@@ -245,6 +305,17 @@ def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
         ngroups=args.ngroups,
         chunk_size=args.chunk_size,
         use_mem_eff_path=args.use_mem_eff_path,
+        n_heads=args.n_heads,
+        n_kv_heads=args.n_kv_heads,
+        mlp_ratio=args.mlp_ratio,
+        d_intermediate=args.d_intermediate,
+        rope_base=args.rope_base,
+        attn_head_dim=args.attn_head_dim,
+        softmax_scale=args.softmax_scale,
+        rope_interleaved=args.rope_interleaved,
+        use_flash_attn=args.use_flash_attn,
+        residual_in_fp32=args.residual_in_fp32,
+        fused_add_norm=args.fused_add_norm,
         include_reference_run=args.include_reference_run,
         region_size=args.region_size,
         message_dim=args.message_dim,
@@ -258,6 +329,7 @@ def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
 
 
 def _make_backbone_spec(cfg: RegionInterfaceConfig) -> BackboneSpec:
+    layer_types = tuple(t.strip() for t in cfg.layer_types.split(",") if t.strip())
     spec = BackboneSpec(
         name=cfg.backbone,
         dim=cfg.dim,
@@ -270,6 +342,18 @@ def _make_backbone_spec(cfg: RegionInterfaceConfig) -> BackboneSpec:
         ngroups=cfg.ngroups,
         chunk_size=cfg.chunk_size,
         use_mem_eff_path=cfg.use_mem_eff_path,
+        n_heads=cfg.n_heads,
+        n_kv_heads=cfg.n_kv_heads,
+        mlp_ratio=cfg.mlp_ratio,
+        d_intermediate=cfg.d_intermediate,
+        rope_base=cfg.rope_base,
+        attn_head_dim=cfg.attn_head_dim,
+        softmax_scale=cfg.softmax_scale,
+        rope_interleaved=cfg.rope_interleaved,
+        use_flash_attn=cfg.use_flash_attn,
+        residual_in_fp32=cfg.residual_in_fp32,
+        fused_add_norm=cfg.fused_add_norm,
+        layer_types=layer_types,
     )
     spec.validate()
     return spec
@@ -322,22 +406,53 @@ def _resolve_text_paths(cfg: RegionInterfaceConfig) -> tuple[Path, Path | None, 
 def _resolve_tokenizer_path(cfg: RegionInterfaceConfig, *, train_path: Path) -> Path:
     if cfg.tokenizer_path:
         return Path(cfg.tokenizer_path)
+    if cfg.tokenizer_type == "llama31":
+        legacy = TOKENIZERS_ROOT / "llama31"
+        if LLAMA31_TOKENIZER_ROOT.exists():
+            return LLAMA31_TOKENIZER_ROOT
+        if legacy.exists():
+            return legacy
+        return LLAMA31_TOKENIZER_ROOT
     if not cfg.train_text_path:
         return TOKENIZERS_ROOT / f"{cfg.text_corpus}_sp_bpe_{cfg.vocab_size}.model"
     return train_path.parent / "tokenizers" / f"{train_path.stem}_sp_bpe_{cfg.vocab_size}.model"
 
 
 def _resolve_token_shards_dir(cfg: RegionInterfaceConfig, *, train_path: Path) -> Path:
+    tag = "llama31" if cfg.tokenizer_type == "llama31" else f"sp_bpe_{cfg.vocab_size}"
     if cfg.token_shards_dir:
         return Path(cfg.token_shards_dir)
     if not cfg.train_text_path:
-        return CORPORA_ROOT / cfg.text_corpus / "tokens" / f"{cfg.text_corpus}_sp_bpe_{cfg.vocab_size}"
-    return train_path.parent / "tokens" / f"{train_path.stem}_sp_bpe_{cfg.vocab_size}"
+        return CORPORA_ROOT / cfg.text_corpus / "tokens" / f"{cfg.text_corpus}_{tag}"
+    return train_path.parent / "tokens" / f"{train_path.stem}_{tag}"
 
 
 def _resolve_token_shard_manifests(cfg: RegionInterfaceConfig, *, train_path: Path) -> tuple[Path, Path]:
     shard_dir = _resolve_token_shards_dir(cfg, train_path=train_path)
     return shard_dir / "train_manifest.json", shard_dir / "val_manifest.json"
+
+
+def _resolve_runtime_vocab_size(cfg: RegionInterfaceConfig) -> int:
+    if cfg.data_mode not in {"text_bpe", "text_bpe_sharded"} or cfg.tokenizer_type != "llama31":
+        return int(cfg.vocab_size)
+    train_path, _, _ = _resolve_text_paths(cfg)
+    tokenizer_path = _resolve_tokenizer_path(cfg, train_path=train_path)
+    tokenizer = load_text_tokenizer(
+        tokenizer_type=cfg.tokenizer_type,
+        tokenizer_path=tokenizer_path,
+        train_path=train_path,
+        vocab_size=cfg.vocab_size,
+        train_bytes=cfg.tokenizer_train_bytes,
+        force_train=False,
+    )
+    actual_vocab_size = int(tokenizer.vocab_size)
+    if cfg.vocab_size != actual_vocab_size:
+        print(
+            f"[tokenizer] overriding vocab_size from {cfg.vocab_size} to llama31 tokenizer vocab_size={actual_vocab_size} "
+            f"from {tokenizer_path}",
+            flush=True,
+        )
+    return actual_vocab_size
 
 
 def _build_corpora(
@@ -390,19 +505,20 @@ def _build_corpora(
         return TokenShardCorpus(train_manifest), TokenShardCorpus(val_manifest)
 
     tokenizer_path = _resolve_tokenizer_path(cfg, train_path=train_path)
-    tokenizer = load_or_train_sentencepiece_bpe_tokenizer(
+    tokenizer = load_text_tokenizer(
+        tokenizer_type=cfg.tokenizer_type,
         tokenizer_path=tokenizer_path,
         train_path=train_path,
         vocab_size=cfg.vocab_size,
         train_bytes=cfg.tokenizer_train_bytes,
         force_train=cfg.train_tokenizer,
     )
-    train_stream = build_sentencepiece_bpe_stream(train_path, tokenizer=tokenizer, device=torch.device("cpu"))
+    train_stream = build_token_stream(train_path, tokenizer=tokenizer, device=torch.device("cpu"))
     if cfg.val_text_path:
-        val_stream = build_sentencepiece_bpe_stream(cfg.val_text_path, tokenizer=tokenizer, device=torch.device("cpu"))
+        val_stream = build_token_stream(cfg.val_text_path, tokenizer=tokenizer, device=torch.device("cpu"))
         return train_stream, val_stream
     if val_path is not None and val_path.exists():
-        val_stream = build_sentencepiece_bpe_stream(val_path, tokenizer=tokenizer, device=torch.device("cpu"))
+        val_stream = build_token_stream(val_path, tokenizer=tokenizer, device=torch.device("cpu"))
         return train_stream, val_stream
     return split_stream_train_val(train_stream, val_fraction=cfg.val_split)
 
@@ -466,11 +582,12 @@ def _infer_data_info(
     info["val_file_bytes"] = int(val_path.stat().st_size) if (val_path is not None and val_path.exists()) else 0
     if cfg.data_mode in {"text_bpe", "text_bpe_sharded"}:
         tokenizer_path = _resolve_tokenizer_path(cfg, train_path=train_path)
-        vocab_path = tokenizer_path.with_suffix(".vocab")
+        vocab_path = tokenizer_path.with_suffix(".vocab") if tokenizer_path.suffix == ".model" else Path("")
         info["tokenizer_path"] = str(tokenizer_path)
+        info["tokenizer_type"] = cfg.tokenizer_type
         info["tokenizer_exists"] = bool(tokenizer_path.exists())
         info["tokenizer_vocab_path"] = str(vocab_path)
-        info["tokenizer_vocab_exists"] = bool(vocab_path.exists())
+        info["tokenizer_vocab_exists"] = bool(vocab_path.exists()) if str(vocab_path) else False
     if cfg.data_mode == "text_bpe":
         info["tokenizer_train_bytes"] = int(cfg.tokenizer_train_bytes)
     if cfg.data_mode == "text_bpe_sharded":
@@ -538,6 +655,7 @@ def _write_run_metadata(
 def _write_csv(path: Path, row: Dict[str, Any]) -> None:
     fieldnames = [
         "step",
+        "tokens_seen",
         "split",
         "ce_loss",
         "message_norm",
@@ -551,6 +669,37 @@ def _write_csv(path: Path, row: Dict[str, Any]) -> None:
         if is_new:
             writer.writeheader()
         writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def _checkpoint_dir(run_dir: Path) -> Path:
+    out = run_dir / "checkpoints"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _save_checkpoint(
+    *,
+    run_dir: Path,
+    filename: str,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    cfg: RegionInterfaceConfig,
+    step: int,
+    tokens_seen: int,
+    extra: Dict[str, Any] | None = None,
+) -> Path:
+    payload: Dict[str, Any] = {
+        "step": int(step),
+        "tokens_seen": int(tokens_seen),
+        "config": cfg.to_dict(),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    if extra:
+        payload.update(extra)
+    path = _checkpoint_dir(run_dir) / filename
+    torch.save(payload, path)
+    return path
 
 
 def _prepare_run_dir(cfg: RegionInterfaceConfig, regime_root: str) -> Path:
@@ -636,6 +785,146 @@ def _assign_grads(params: list[torch.nn.Parameter], grads: list[torch.Tensor | N
             p.grad = g.detach()
 
 
+def _collect_named_grads(model: nn.Module) -> Dict[str, torch.Tensor | None]:
+    grad_map: Dict[str, torch.Tensor | None] = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        grad_map[name] = None if param.grad is None else param.grad.detach().clone()
+    return grad_map
+
+
+def _assign_grad_map(model: nn.Module, grad_map: Dict[str, torch.Tensor | None]) -> None:
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        grad = grad_map.get(name)
+        param.grad = None if grad is None else grad.detach().clone()
+
+
+def _store_named_grads(
+    grad_map: Dict[str, torch.Tensor | None],
+    param_name_map: Dict[int, str],
+    params: list[torch.nn.Parameter],
+    grads: tuple[torch.Tensor | None, ...] | list[torch.Tensor | None],
+) -> None:
+    for param, grad in zip(params, grads):
+        name = param_name_map[id(param)]
+        grad_map[name] = None if grad is None else grad.detach().clone()
+
+
+def _native_backward_step(
+    model: NativeRegionInterfaceModel,
+    *,
+    ce_loss: torch.Tensor,
+    cache: Dict[str, Any],
+) -> NativeBackwardResult:
+    param_name_map = {id(param): name for name, param in model.named_parameters() if param.requires_grad}
+    grad_map: Dict[str, torch.Tensor | None] = {
+        name: None for name, param in model.named_parameters() if param.requires_grad
+    }
+
+    region_messages = list(cache["region_messages"])
+    region_ranges = list(cache["region_ranges"])
+    n_regions = len(region_ranges)
+    if n_regions == 0:
+        raise RuntimeError("native_region_interface requires at least one region.")
+
+    head_params = [p for p in list(model.norm.parameters()) + list(model.lm_head.parameters()) if p.requires_grad]
+    head_grads = torch.autograd.grad(
+        ce_loss,
+        head_params,
+        retain_graph=True,
+        create_graph=False,
+        allow_unused=True,
+    )
+    _store_named_grads(grad_map, param_name_map, head_params, head_grads)
+
+    if n_regions == 1:
+        g_msg_inputs = [
+            torch.autograd.grad(
+                ce_loss,
+                region_messages[0],
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=False,
+            )[0].detach().to(device=region_messages[0].device, dtype=region_messages[0].dtype)
+        ]
+        interface_scan_rms = 0.0
+    else:
+        g_last_input = torch.autograd.grad(
+            ce_loss,
+            region_messages[-2],
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=False,
+        )[0].detach()
+        mats = model.materialize_interface_pullback_mats(cache)
+        g_last_input = g_last_input.to(device=mats[0].device, dtype=mats[0].dtype)
+        g_msg_inputs = model.interface_vjp_scan_from_last_input_seed(mats, g_last_input)
+        g_manual = [torch.zeros_like(g_last_input) for _ in range(n_regions)]
+        g_manual[-1] = g_last_input
+        for ridx in reversed(range(n_regions - 1)):
+            g_manual[ridx] = model._apply_pullback_mat(mats[ridx], g_manual[ridx + 1], out_dtype=g_manual[ridx + 1].dtype)
+        diffs = [((a - b) ** 2).mean() for a, b in zip(g_msg_inputs, g_manual)]
+        interface_scan_rms = float(torch.sqrt(torch.stack(diffs).mean()).item())
+
+    input_params = [p for p in model.input_to_message.parameters() if p.requires_grad]
+    input_grads = torch.autograd.grad(
+        region_messages[0],
+        input_params,
+        grad_outputs=g_msg_inputs[0],
+        retain_graph=True,
+        create_graph=False,
+        allow_unused=True,
+    )
+    _store_named_grads(grad_map, param_name_map, input_params, input_grads)
+
+    for ridx, (start, end) in enumerate(region_ranges):
+        region_params: list[torch.nn.Parameter] = []
+        for li in range(start, end):
+            region_params.extend([p for p in model.blocks[li].parameters() if p.requires_grad])
+        region_params.extend([p for p in model.message_to_hidden[ridx].parameters() if p.requires_grad])
+        region_params.extend([p for p in model.hidden_to_message[ridx].parameters() if p.requires_grad])
+        region_params.extend([p for p in model.message_norm[ridx].parameters() if p.requires_grad])
+
+        if ridx < n_regions - 1:
+            grads = torch.autograd.grad(
+                region_messages[ridx + 1],
+                region_params,
+                grad_outputs=g_msg_inputs[ridx + 1],
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True,
+            )
+        else:
+            grads = torch.autograd.grad(
+                ce_loss,
+                region_params,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True,
+            )
+        _store_named_grads(grad_map, param_name_map, region_params, grads)
+
+    shared_params = [model.embedding.weight, model.message_alpha]
+    shared_grads = torch.autograd.grad(
+        ce_loss,
+        shared_params,
+        retain_graph=False,
+        create_graph=False,
+        allow_unused=True,
+    )
+    _store_named_grads(grad_map, param_name_map, shared_params, shared_grads)
+    return NativeBackwardResult(grad_map=grad_map, interface_scan_rms=interface_scan_rms)
+
+
+def _autograd_backward_step(model: nn.Module, *, ce_loss: torch.Tensor) -> Dict[str, torch.Tensor | None]:
+    model.zero_grad(set_to_none=True)
+    ce_loss.backward()
+    return _collect_named_grads(model)
+
+
 def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dict[str, Any]:
     device = _resolve_device(cfg)
     torch.manual_seed(cfg.seed)
@@ -659,6 +948,10 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
     final_val = float("nan")
     best_val = float("inf")
     best_val_step = -1
+    best_checkpoint_path = ""
+    latest_checkpoint_path = ""
+    train_tokens_per_step = int(cfg.batch_size * cfg.seq_len)
+    total_train_tokens = 0
 
     for step in range(1, cfg.steps + 1):
         t0 = time.perf_counter()
@@ -681,19 +974,43 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
         t1 = time.perf_counter()
 
         final_train = float(ce_loss.item())
+        total_train_tokens = int(step * train_tokens_per_step)
         row = {
             "step": step,
+            "tokens_seen": total_train_tokens,
             "split": "train",
             "ce_loss": final_train,
             "message_norm": "",
             "scan_align": "",
-            "tokens_per_s": float((cfg.batch_size * cfg.seq_len) / max(1e-9, (t1 - t0))),
+            "tokens_per_s": float(train_tokens_per_step / max(1e-9, (t1 - t0))),
             "wall_time_s": float(t1 - t0),
         }
         if (step % cfg.log_every) == 0 or step == 1:
             _write_csv(metrics_csv, row)
             with metrics_jsonl.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row, sort_keys=True) + "\n")
+        if (step % cfg.save_every) == 0 or step == cfg.steps:
+            _save_checkpoint(
+                run_dir=run_dir,
+                filename=f"step_{step:07d}.pt",
+                model=model,
+                optimizer=optimizer,
+                cfg=cfg,
+                step=step,
+                tokens_seen=total_train_tokens,
+                extra={"regime": "backprop_ref", "train_ce_loss": final_train},
+            )
+            latest_path = _save_checkpoint(
+                run_dir=run_dir,
+                filename="latest.pt",
+                model=model,
+                optimizer=optimizer,
+                cfg=cfg,
+                step=step,
+                tokens_seen=total_train_tokens,
+                extra={"regime": "backprop_ref", "train_ce_loss": final_train},
+            )
+            latest_checkpoint_path = str(latest_path)
 
         if (step % cfg.eval_every) == 0 or step == cfg.steps:
             val = _evaluate_reference(
@@ -708,8 +1025,26 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
             if final_val < best_val:
                 best_val = final_val
                 best_val_step = step
+                best_checkpoint_path = str(
+                    _save_checkpoint(
+                        run_dir=run_dir,
+                        filename="best.pt",
+                        model=model,
+                        optimizer=optimizer,
+                        cfg=cfg,
+                        step=step,
+                        tokens_seen=total_train_tokens,
+                        extra={
+                            "regime": "backprop_ref",
+                            "train_ce_loss": final_train,
+                            "val_ce_loss": final_val,
+                            "is_best": True,
+                        },
+                    )
+                )
             val_row = {
                 "step": step,
+                "tokens_seen": total_train_tokens,
                 "split": "val",
                 "ce_loss": final_val,
                 "message_norm": "",
@@ -729,6 +1064,10 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
         "final_val_ce_loss": final_val,
         "best_val_ce_loss": best_val,
         "best_val_step": best_val_step,
+        "train_tokens_per_step": train_tokens_per_step,
+        "total_train_tokens": total_train_tokens,
+        "best_checkpoint_path": best_checkpoint_path,
+        "latest_checkpoint_path": latest_checkpoint_path,
         "run_dir": str(run_dir),
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -767,6 +1106,10 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
     best_val = float("inf")
     best_val_step = -1
     final_eval_message_ablations: Dict[str, float] = {}
+    best_checkpoint_path = ""
+    latest_checkpoint_path = ""
+    train_tokens_per_step = int(cfg.batch_size * cfg.seq_len)
+    total_train_tokens = 0
 
     for step in range(1, cfg.steps + 1):
         t0 = time.perf_counter()
@@ -782,99 +1125,9 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
             logits, cache = model.forward_with_cache(xb)
         ce_loss = _next_token_loss(logits, yb)
         optimizer.zero_grad(set_to_none=True)
-
-        region_messages = list(cache["region_messages"])
-        region_ranges = list(cache["region_ranges"])
-        n_regions = len(region_ranges)
-        if n_regions == 0:
-            raise RuntimeError("native_region_interface requires at least one region.")
-
-        head_params = [p for p in list(model.norm.parameters()) + list(model.lm_head.parameters()) if p.requires_grad]
-        head_grads = torch.autograd.grad(
-            ce_loss,
-            head_params,
-            retain_graph=True,
-            create_graph=False,
-            allow_unused=True,
-        )
-        _assign_grads(head_params, list(head_grads))
-
-        if n_regions == 1:
-            g_msg_inputs = [
-                torch.autograd.grad(
-                    ce_loss,
-                    region_messages[0],
-                    retain_graph=True,
-                    create_graph=False,
-                    allow_unused=False,
-                )[0].detach().to(device=region_messages[0].device, dtype=region_messages[0].dtype)
-            ]
-            interface_scan_rms = 0.0
-        else:
-            g_last_input = torch.autograd.grad(
-                ce_loss,
-                region_messages[-2],
-                retain_graph=True,
-                create_graph=False,
-                allow_unused=False,
-            )[0].detach()
-            mats = model.materialize_interface_pullback_mats(cache)
-            g_last_input = g_last_input.to(device=mats[0].device, dtype=mats[0].dtype)
-            g_msg_inputs = model.interface_vjp_scan_from_last_input_seed(mats, g_last_input)
-            g_manual = [torch.zeros_like(g_last_input) for _ in range(n_regions)]
-            g_manual[-1] = g_last_input
-            for ridx in reversed(range(n_regions - 1)):
-                g_manual[ridx] = model._apply_pullback_mat(mats[ridx], g_manual[ridx + 1], out_dtype=g_manual[ridx + 1].dtype)
-            diffs = [((a - b) ** 2).mean() for a, b in zip(g_msg_inputs, g_manual)]
-            interface_scan_rms = float(torch.sqrt(torch.stack(diffs).mean()).item())
-
-        input_params = [p for p in model.input_to_message.parameters() if p.requires_grad]
-        input_grads = torch.autograd.grad(
-            region_messages[0],
-            input_params,
-            grad_outputs=g_msg_inputs[0],
-            retain_graph=True,
-            create_graph=False,
-            allow_unused=True,
-        )
-        _assign_grads(input_params, list(input_grads))
-
-        for ridx, (start, end) in enumerate(region_ranges):
-            region_params: list[torch.nn.Parameter] = []
-            for li in range(start, end):
-                region_params.extend([p for p in model.blocks[li].parameters() if p.requires_grad])
-            region_params.extend([p for p in model.message_to_hidden[ridx].parameters() if p.requires_grad])
-            region_params.extend([p for p in model.hidden_to_message[ridx].parameters() if p.requires_grad])
-            region_params.extend([p for p in model.message_norm[ridx].parameters() if p.requires_grad])
-
-            if ridx < n_regions - 1:
-                grads = torch.autograd.grad(
-                    region_messages[ridx + 1],
-                    region_params,
-                    grad_outputs=g_msg_inputs[ridx + 1],
-                    retain_graph=True,
-                    create_graph=False,
-                    allow_unused=True,
-                )
-            else:
-                grads = torch.autograd.grad(
-                    ce_loss,
-                    region_params,
-                    retain_graph=True,
-                    create_graph=False,
-                    allow_unused=True,
-                )
-            _assign_grads(region_params, list(grads))
-
-        shared_params = [model.embedding.weight, model.message_alpha]
-        shared_grads = torch.autograd.grad(
-            ce_loss,
-            shared_params,
-            retain_graph=False,
-            create_graph=False,
-            allow_unused=True,
-        )
-        _assign_grads(shared_params, list(shared_grads))
+        backward_result = _native_backward_step(model, ce_loss=ce_loss, cache=cache)
+        _assign_grad_map(model, backward_result.grad_map)
+        interface_scan_rms = backward_result.interface_scan_rms
 
         if cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -882,21 +1135,53 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
         t1 = time.perf_counter()
 
         final_train = float(ce_loss.item())
+        total_train_tokens = int(step * train_tokens_per_step)
         msgs = cache.get("region_messages", [])
         msg_norm = float(torch.stack([m.norm(dim=-1).mean() for m in msgs]).mean().item()) if msgs else 0.0
         row = {
             "step": step,
+            "tokens_seen": total_train_tokens,
             "split": "train",
             "ce_loss": final_train,
             "message_norm": msg_norm,
             "scan_align": interface_scan_rms,
-            "tokens_per_s": float((cfg.batch_size * cfg.seq_len) / max(1e-9, (t1 - t0))),
+            "tokens_per_s": float(train_tokens_per_step / max(1e-9, (t1 - t0))),
             "wall_time_s": float(t1 - t0),
         }
         if (step % cfg.log_every) == 0 or step == 1:
             _write_csv(metrics_csv, row)
             with metrics_jsonl.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row, sort_keys=True) + "\n")
+        if (step % cfg.save_every) == 0 or step == cfg.steps:
+            _save_checkpoint(
+                run_dir=run_dir,
+                filename=f"step_{step:07d}.pt",
+                model=model,
+                optimizer=optimizer,
+                cfg=cfg,
+                step=step,
+                tokens_seen=total_train_tokens,
+                extra={
+                    "regime": "native_region_interface",
+                    "train_ce_loss": final_train,
+                    "interface_scan_rms": interface_scan_rms,
+                },
+            )
+            latest_path = _save_checkpoint(
+                run_dir=run_dir,
+                filename="latest.pt",
+                model=model,
+                optimizer=optimizer,
+                cfg=cfg,
+                step=step,
+                tokens_seen=total_train_tokens,
+                extra={
+                    "regime": "native_region_interface",
+                    "train_ce_loss": final_train,
+                    "interface_scan_rms": interface_scan_rms,
+                },
+            )
+            latest_checkpoint_path = str(latest_path)
 
         if (step % cfg.eval_every) == 0 or step == cfg.steps:
             eval_step_gen = torch.Generator(device=gen_device)
@@ -913,8 +1198,27 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
             if final_val < best_val:
                 best_val = final_val
                 best_val_step = step
+                best_checkpoint_path = str(
+                    _save_checkpoint(
+                        run_dir=run_dir,
+                        filename="best.pt",
+                        model=model,
+                        optimizer=optimizer,
+                        cfg=cfg,
+                        step=step,
+                        tokens_seen=total_train_tokens,
+                        extra={
+                            "regime": "native_region_interface",
+                            "train_ce_loss": final_train,
+                            "val_ce_loss": final_val,
+                            "interface_scan_rms": interface_scan_rms,
+                            "is_best": True,
+                        },
+                    )
+                )
             val_row = {
                 "step": step,
+                "tokens_seen": total_train_tokens,
                 "split": "val",
                 "ce_loss": final_val,
                 "message_norm": "",
@@ -945,6 +1249,7 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
                 final_eval_message_ablations[split_name] = float(ablated["ce_loss"])
                 ablation_row = {
                     "step": step,
+                    "tokens_seen": total_train_tokens,
                     "split": split_name,
                     "ce_loss": float(ablated["ce_loss"]),
                     "message_norm": "",
@@ -964,6 +1269,10 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
         "final_val_ce_loss": final_val,
         "best_val_ce_loss": best_val,
         "best_val_step": best_val_step,
+        "train_tokens_per_step": train_tokens_per_step,
+        "total_train_tokens": total_train_tokens,
+        "best_checkpoint_path": best_checkpoint_path,
+        "latest_checkpoint_path": latest_checkpoint_path,
         "final_eval_message_ablations": final_eval_message_ablations,
         "run_dir": str(run_dir),
     }
@@ -972,6 +1281,7 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
 
 
 def run_training(cfg: RegionInterfaceConfig) -> Dict[str, Any]:
+    cfg.vocab_size = _resolve_runtime_vocab_size(cfg)
     regimes = ["native_region_interface"]
     root_dir = _prepare_run_dir(cfg, regime_root=cfg.regime)
     runs = []

@@ -1,5 +1,6 @@
 # Python bytecode and caches
 __pycache__/
+cuda/**/__pycache__/
 *.py[cod]
 *$py.class
 
@@ -10,7 +11,8 @@ __pycache__/
 build/
 dist/
 *.egg-info/
-cuda/build/
+cuda/**/build/
+cuda/**/build_logs/
 rscan_cuda*.so
 
 # Test and tool caches
