@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -40,13 +41,14 @@ class NativeBackwardResult:
 
 @dataclass
 class RegionInterfaceConfig:
-    regime: str = "all"  # native_region_interface | all
+    regime: str = "all"  # backprop_ref | native_region_interface | all
     backbone: str = "mamba1"
     layer_types: str = ""
     seed: int = 7
     device: str = "auto"  # auto | cpu | cuda
     dtype: str = "float32"
     output_dir: str = "out/region_interface"
+    checkpoint_root: str = ""
     run_name: str = ""
     resume_from: str = ""
     init_from: str = ""
@@ -71,7 +73,11 @@ class RegionInterfaceConfig:
     eval_batches: int = 4
     log_every: int = 5
     save_every: int = 100
+    save_checkpoints: bool = True
     lr_model: float = 1e-3
+    lr_schedule: str = "constant"  # constant | cosine | linear
+    warmup_steps: int = 0
+    min_lr_ratio: float = 0.0
     weight_decay: float = 0.0
     grad_clip: float = 1.0
     layers: int = 4
@@ -122,6 +128,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--dtype", type=str, default="float32")
     p.add_argument("--output-dir", type=str, default="out/region_interface")
+    p.add_argument("--checkpoint-root", type=str, default="")
     p.add_argument("--run-name", type=str, default="")
     p.add_argument("--resume-from", type=str, default="")
     p.add_argument("--init-from", type=str, default="")
@@ -146,7 +153,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-batches", type=int, default=4)
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--save-every", type=int, default=100)
+    p.add_argument("--save-checkpoints", dest="save_checkpoints", action="store_true")
+    p.add_argument("--no-save-checkpoints", dest="save_checkpoints", action="store_false")
+    p.set_defaults(save_checkpoints=True)
     p.add_argument("--lr-model", type=float, default=1e-3)
+    p.add_argument("--lr-schedule", type=str, default="constant")
+    p.add_argument("--warmup-steps", type=int, default=0)
+    p.add_argument("--min-lr-ratio", type=float, default=0.0)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--layers", type=int, default=4)
@@ -192,8 +205,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _validate_cfg(cfg: RegionInterfaceConfig) -> None:
-    if cfg.regime not in {"native_region_interface", "all"}:
-        raise ValueError("regime must be one of: native_region_interface, all")
+    if cfg.regime not in {"backprop_ref", "native_region_interface", "all"}:
+        raise ValueError("regime must be one of: backprop_ref, native_region_interface, all")
     if cfg.backbone not in {"mamba1", "mamba2", "mamba3", "transformer", "hybrid"}:
         raise ValueError("backbone must be one of: mamba1, mamba2, mamba3, transformer, hybrid")
     if cfg.backbone == "hybrid" and not cfg.layer_types.strip():
@@ -236,8 +249,18 @@ def _validate_cfg(cfg: RegionInterfaceConfig) -> None:
         raise ValueError("eval_every must be > 0")
     if cfg.log_every <= 0:
         raise ValueError("log_every must be > 0")
-    if cfg.save_every <= 0:
-        raise ValueError("save_every must be > 0")
+    if cfg.save_checkpoints and cfg.save_every <= 0:
+        raise ValueError("save_every must be > 0 when save_checkpoints is enabled")
+    if cfg.lr_model <= 0.0:
+        raise ValueError("lr_model must be > 0")
+    if cfg.lr_schedule not in {"constant", "cosine", "linear"}:
+        raise ValueError("lr_schedule must be one of: constant, cosine, linear")
+    if cfg.warmup_steps < 0:
+        raise ValueError("warmup_steps must be >= 0")
+    if cfg.warmup_steps > cfg.steps:
+        raise ValueError("warmup_steps must be <= steps")
+    if cfg.min_lr_ratio < 0.0 or cfg.min_lr_ratio > 1.0:
+        raise ValueError("min_lr_ratio must be in [0, 1]")
     if cfg.region_size <= 0:
         raise ValueError("region_size must be > 0.")
     if cfg.message_dim <= 0:
@@ -276,6 +299,7 @@ def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
         device=args.device,
         dtype=args.dtype,
         output_dir=args.output_dir,
+        checkpoint_root=args.checkpoint_root,
         run_name=args.run_name,
         resume_from=args.resume_from,
         init_from=args.init_from,
@@ -300,7 +324,11 @@ def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
         eval_batches=args.eval_batches,
         log_every=args.log_every,
         save_every=args.save_every,
+        save_checkpoints=args.save_checkpoints,
         lr_model=args.lr_model,
+        lr_schedule=args.lr_schedule,
+        warmup_steps=args.warmup_steps,
+        min_lr_ratio=args.min_lr_ratio,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         layers=args.layers,
@@ -679,10 +707,62 @@ def _write_csv(path: Path, row: Dict[str, Any]) -> None:
         writer.writerow({k: row.get(k, "") for k in fieldnames})
 
 
-def _checkpoint_dir(run_dir: Path) -> Path:
-    out = run_dir / "checkpoints"
+def _lr_multiplier(cfg: RegionInterfaceConfig, step: int) -> float:
+    if step <= 0:
+        return 0.0
+    warmup_steps = cfg.warmup_steps
+    if warmup_steps > 0 and step <= warmup_steps:
+        return float(step) / float(warmup_steps)
+    if cfg.lr_schedule == "constant":
+        return 1.0
+    decay_steps = max(1, cfg.steps - warmup_steps)
+    decay_progress = min(1.0, max(0.0, float(step - warmup_steps) / float(decay_steps)))
+    if cfg.lr_schedule == "linear":
+        decay_multiplier = 1.0 - decay_progress
+    elif cfg.lr_schedule == "cosine":
+        decay_multiplier = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+    else:
+        raise ValueError(f"unsupported lr_schedule: {cfg.lr_schedule}")
+    return cfg.min_lr_ratio + ((1.0 - cfg.min_lr_ratio) * decay_multiplier)
+
+
+def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def _scheduled_lr(cfg: RegionInterfaceConfig, step: int) -> float:
+    return float(cfg.lr_model * _lr_multiplier(cfg, step))
+
+
+def _checkpoint_dir(run_dir: Path, cfg: RegionInterfaceConfig) -> Path:
+    if cfg.checkpoint_root:
+        output_root = Path(cfg.output_dir).expanduser().resolve()
+        checkpoint_root = Path(cfg.checkpoint_root).expanduser().resolve()
+        try:
+            relative_dir = run_dir.resolve().relative_to(output_root.parent)
+        except ValueError:
+            relative_dir = Path(run_dir.name)
+        out = checkpoint_root / relative_dir / "checkpoints"
+    else:
+        out = run_dir / "checkpoints"
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def _checkpoint_path_from_summary(summary_path: Path, *, preference: str) -> Path | None:
+    if not summary_path.exists():
+        return None
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    preferred_key = "latest_checkpoint_path" if preference == "latest" else "best_checkpoint_path"
+    fallback_key = "best_checkpoint_path" if preference == "latest" else "latest_checkpoint_path"
+    for key in (preferred_key, fallback_key):
+        candidate = str(summary.get(key, "")).strip()
+        if candidate:
+            path = Path(candidate).expanduser()
+            if path.exists():
+                return path
+    return None
 
 
 def _save_checkpoint(
@@ -716,7 +796,7 @@ def _save_checkpoint(
     }
     if extra:
         payload.update(extra)
-    path = _checkpoint_dir(run_dir) / filename
+    path = _checkpoint_dir(run_dir, cfg) / filename
     torch.save(payload, path)
     return path
 
@@ -761,6 +841,17 @@ def _resolve_checkpoint_path(
     for candidate in candidates:
         if candidate.exists():
             return candidate
+    if (source / "metrics.csv").exists():
+        from_summary = _checkpoint_path_from_summary(source / "summary.json", preference=preference)
+        if from_summary is not None:
+            return from_summary
+    else:
+        from_regime_summary = _checkpoint_path_from_summary(source / regime / "summary.json", preference=preference)
+        if from_regime_summary is not None:
+            return from_regime_summary
+        from_summary = _checkpoint_path_from_summary(source / "summary.json", preference=preference)
+        if from_summary is not None:
+            return from_summary
     return None
 
 
@@ -1102,10 +1193,12 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
     start_step = int(restore["start_step"])
     resumed_from = str(restore["checkpoint_path"]) if cfg.resume_from else ""
     initialized_from = str(restore["checkpoint_path"]) if cfg.init_from else ""
+    _set_optimizer_lr(optimizer, _scheduled_lr(cfg, start_step))
 
     for step in range(start_step + 1, cfg.steps + 1):
         t0 = time.perf_counter()
         model.train()
+        _set_optimizer_lr(optimizer, _scheduled_lr(cfg, step))
         xb, yb = _sample_batch_any(
             cfg=cfg,
             corpus=train_corpus,
@@ -1153,28 +1246,29 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
             if final_val < best_val:
                 best_val = final_val
                 best_val_step = step
-                best_checkpoint_path = str(
-                    _save_checkpoint(
-                        run_dir=run_dir,
-                        filename="best.pt",
-                        model=model,
-                        optimizer=optimizer,
-                        cfg=cfg,
-                        device=device,
-                        train_generator=train_gen,
-                        eval_generator=eval_gen,
-                        step=step,
-                        tokens_seen=total_train_tokens,
-                        best_val_ce_loss=best_val,
-                        best_val_step=best_val_step,
-                        extra={
-                            "regime": "backprop_ref",
-                            "train_ce_loss": final_train,
-                            "val_ce_loss": final_val,
-                            "is_best": True,
-                        },
+                if cfg.save_checkpoints:
+                    best_checkpoint_path = str(
+                        _save_checkpoint(
+                            run_dir=run_dir,
+                            filename="best.pt",
+                            model=model,
+                            optimizer=optimizer,
+                            cfg=cfg,
+                            device=device,
+                            train_generator=train_gen,
+                            eval_generator=eval_gen,
+                            step=step,
+                            tokens_seen=total_train_tokens,
+                            best_val_ce_loss=best_val,
+                            best_val_step=best_val_step,
+                            extra={
+                                "regime": "backprop_ref",
+                                "train_ce_loss": final_train,
+                                "val_ce_loss": final_val,
+                                "is_best": True,
+                            },
+                        )
                     )
-                )
             val_row = {
                 "step": step,
                 "tokens_seen": total_train_tokens,
@@ -1189,7 +1283,7 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
             with metrics_jsonl.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(val_row, sort_keys=True) + "\n")
 
-        if (step % cfg.save_every) == 0 or step == cfg.steps:
+        if cfg.save_checkpoints and ((step % cfg.save_every) == 0 or step == cfg.steps):
             _save_checkpoint(
                 run_dir=run_dir,
                 filename=f"step_{step:07d}.pt",
@@ -1233,6 +1327,7 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
         "best_val_step": best_val_step,
         "train_tokens_per_step": train_tokens_per_step,
         "total_train_tokens": total_train_tokens,
+        "save_checkpoints": bool(cfg.save_checkpoints),
         "best_checkpoint_path": best_checkpoint_path,
         "latest_checkpoint_path": latest_checkpoint_path,
         "resumed_from": resumed_from,
@@ -1292,10 +1387,12 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
     start_step = int(restore["start_step"])
     resumed_from = str(restore["checkpoint_path"]) if cfg.resume_from else ""
     initialized_from = str(restore["checkpoint_path"]) if cfg.init_from else ""
+    _set_optimizer_lr(optimizer, _scheduled_lr(cfg, start_step))
 
     for step in range(start_step + 1, cfg.steps + 1):
         t0 = time.perf_counter()
         model.train()
+        _set_optimizer_lr(optimizer, _scheduled_lr(cfg, step))
         xb, yb = _sample_batch_any(
             cfg=cfg,
             corpus=train_corpus,
@@ -1349,29 +1446,30 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
             if final_val < best_val:
                 best_val = final_val
                 best_val_step = step
-                best_checkpoint_path = str(
-                    _save_checkpoint(
-                        run_dir=run_dir,
-                        filename="best.pt",
-                        model=model,
-                        optimizer=optimizer,
-                        cfg=cfg,
-                        device=device,
-                        train_generator=train_gen,
-                        eval_generator=eval_gen,
-                        step=step,
-                        tokens_seen=total_train_tokens,
-                        best_val_ce_loss=best_val,
-                        best_val_step=best_val_step,
-                        extra={
-                            "regime": "native_region_interface",
-                            "train_ce_loss": final_train,
-                            "val_ce_loss": final_val,
-                            "interface_scan_rms": interface_scan_rms,
-                            "is_best": True,
-                        },
+                if cfg.save_checkpoints:
+                    best_checkpoint_path = str(
+                        _save_checkpoint(
+                            run_dir=run_dir,
+                            filename="best.pt",
+                            model=model,
+                            optimizer=optimizer,
+                            cfg=cfg,
+                            device=device,
+                            train_generator=train_gen,
+                            eval_generator=eval_gen,
+                            step=step,
+                            tokens_seen=total_train_tokens,
+                            best_val_ce_loss=best_val,
+                            best_val_step=best_val_step,
+                            extra={
+                                "regime": "native_region_interface",
+                                "train_ce_loss": final_train,
+                                "val_ce_loss": final_val,
+                                "interface_scan_rms": interface_scan_rms,
+                                "is_best": True,
+                            },
+                        )
                     )
-                )
             val_row = {
                 "step": step,
                 "tokens_seen": total_train_tokens,
@@ -1417,7 +1515,7 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
                 with metrics_jsonl.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(ablation_row, sort_keys=True) + "\n")
 
-        if (step % cfg.save_every) == 0 or step == cfg.steps:
+        if cfg.save_checkpoints and ((step % cfg.save_every) == 0 or step == cfg.steps):
             _save_checkpoint(
                 run_dir=run_dir,
                 filename=f"step_{step:07d}.pt",
@@ -1469,6 +1567,7 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
         "best_val_step": best_val_step,
         "train_tokens_per_step": train_tokens_per_step,
         "total_train_tokens": total_train_tokens,
+        "save_checkpoints": bool(cfg.save_checkpoints),
         "best_checkpoint_path": best_checkpoint_path,
         "latest_checkpoint_path": latest_checkpoint_path,
         "final_eval_message_ablations": final_eval_message_ablations,
@@ -1482,18 +1581,23 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
 
 def run_training(cfg: RegionInterfaceConfig) -> Dict[str, Any]:
     cfg.vocab_size = _resolve_runtime_vocab_size(cfg)
-    regimes = ["native_region_interface"]
     root_dir = _infer_existing_root_dir(cfg.resume_from) if cfg.resume_from else _prepare_run_dir(cfg, regime_root=cfg.regime)
     root_dir.mkdir(parents=True, exist_ok=True)
     runs = []
-    if cfg.include_reference_run:
-        ref_dir = root_dir / "backprop_ref"
-        ref_dir.mkdir(parents=True, exist_ok=True)
-        runs.append(_run_reference_backprop(cfg, run_dir=ref_dir))
-    for regime in regimes:
+    active_regimes = (
+        ["backprop_ref", "native_region_interface"]
+        if cfg.regime == "all"
+        else [cfg.regime]
+    )
+    for regime in active_regimes:
         run_dir = root_dir / regime
         run_dir.mkdir(parents=True, exist_ok=True)
-        runs.append(_run_native_region_interface(cfg, run_dir=run_dir))
+        if regime == "backprop_ref":
+            runs.append(_run_reference_backprop(cfg, run_dir=run_dir))
+        elif regime == "native_region_interface":
+            runs.append(_run_native_region_interface(cfg, run_dir=run_dir))
+        else:
+            raise AssertionError(f"unsupported active regime: {regime}")
     summary = {"regime": cfg.regime, "root_dir": str(root_dir), "runs": runs}
     (root_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     return summary
