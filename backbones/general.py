@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 
-SUPPORTED_BACKBONES = ("mamba1", "mamba2", "mamba3", "transformer")
+SUPPORTED_BACKBONES = ("mamba2", "mamba3", "transformer")
 _HYBRID_SUPPORTED_LAYER_TYPES = ("mamba2", "mamba3", "transformer")
 
 
@@ -16,7 +16,7 @@ _HYBRID_SUPPORTED_LAYER_TYPES = ("mamba2", "mamba3", "transformer")
 class BackboneSpec:
     """Shared backbone configuration surface for region-interface experiments."""
 
-    name: str = "mamba1"
+    name: str = "transformer"
     dim: int = 64
     layers: int = 4
     d_state: int = 8
@@ -163,8 +163,6 @@ def build_backbone_stack(spec: BackboneSpec) -> BackboneStack:
     """Build the selected backbone as a reusable stack/segment module."""
 
     spec.validate()
-    if spec.name == "mamba1":
-        return _build_mamba1_stack(spec)
     if spec.name == "mamba2":
         return _build_mamba2_stack(spec)
     if spec.name == "mamba3":
@@ -240,29 +238,6 @@ def infer_message_hidden_dim(spec: BackboneSpec, explicit_value: int) -> int:
     if explicit_value > 0:
         return explicit_value
     return spec.dim
-
-
-def _build_mamba1_stack(spec: BackboneSpec) -> BackboneStack:
-    from backbones.mamba1.block import MambaResidualBlock
-    from backbones.mamba1.config import BlockConfig
-    from backbones.mamba1.mamba import make_backend as make_mamba_backend
-
-    dt_rank_cfg = spec.dt_rank if spec.dt_rank is not None else "auto"
-    block_cfg = BlockConfig(
-        dim=spec.dim,
-        d_state=spec.d_state,
-        dt_rank=dt_rank_cfg,
-        expand=spec.expand,
-        d_conv=spec.d_conv,
-        bias=spec.bias,
-        conv_bias=spec.conv_bias,
-        bidirectional=False,
-        use_depth_scan=False,
-    )
-    blocks = nn.ModuleList(
-        [MambaResidualBlock(block_cfg, make_mamba_backend(block_cfg)) for _ in range(spec.layers)]
-    )
-    return LayerwiseBackboneStack(blocks)
 
 
 def _build_mamba2_stack(spec: BackboneSpec) -> BackboneStack:

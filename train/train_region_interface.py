@@ -49,7 +49,7 @@ class NativeBackwardResult:
 @dataclass
 class RegionInterfaceConfig:
     regime: str = "all"  # backprop_ref | native_region_interface | all
-    backbone: str = "mamba1"
+    backbone: str = "transformer"
     layer_types: str = ""
     seed: int = 7
     device: str = "auto"  # auto | cpu | cuda
@@ -134,7 +134,7 @@ class RegionInterfaceConfig:
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train bounded region interfaces on a dense Mamba backbone.")
     p.add_argument("--regime", type=str, default="all")
-    p.add_argument("--backbone", type=str, default="mamba1")
+    p.add_argument("--backbone", type=str, default="transformer")
     p.add_argument("--layer-types", type=str, default="")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--device", type=str, default="auto")
@@ -227,8 +227,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def _validate_cfg(cfg: RegionInterfaceConfig) -> None:
     if cfg.regime not in {"backprop_ref", "native_region_interface", "all"}:
         raise ValueError("regime must be one of: backprop_ref, native_region_interface, all")
-    if cfg.backbone not in {"mamba1", "mamba2", "mamba3", "transformer", "hybrid"}:
-        raise ValueError("backbone must be one of: mamba1, mamba2, mamba3, transformer, hybrid")
+    if cfg.backbone not in {"mamba2", "mamba3", "transformer", "hybrid"}:
+        raise ValueError("backbone must be one of: mamba2, mamba3, transformer, hybrid")
     if cfg.backbone == "hybrid" and not cfg.layer_types.strip():
         raise ValueError("hybrid backbone requires --layer-types")
     if cfg.dtype not in {"float32", "bfloat16"}:
