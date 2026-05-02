@@ -205,11 +205,12 @@ def _make_final_norm(backbone_spec: BackboneSpec) -> nn.Module:
 class ReferenceLM(nn.Module):
     """Shared dense autoregressive reference model built from a backbone stack."""
 
-    def __init__(self, *, vocab_size: int, backbone_spec: BackboneSpec):
+    def __init__(self, *, vocab_size: int, backbone_spec: BackboneSpec, tie_embeddings: bool = False):
         super().__init__()
         backbone_spec.validate()
         self.vocab_size = vocab_size
         self.backbone_spec = backbone_spec
+        self.tie_embeddings = bool(tie_embeddings)
         self.embedding = nn.Embedding(vocab_size, backbone_spec.dim)
         self.backbone = build_backbone_stack(backbone_spec)
         self.blocks = self.backbone.blocks
@@ -223,6 +224,9 @@ class ReferenceLM(nn.Module):
                 if layer_type == "transformer":
                     init_transformer_module(block, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
             init_transformer_module(self.lm_head, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
+        if self.tie_embeddings:
+            nn.init.normal_(self.embedding.weight, std=0.02)
+            self.lm_head.weight = self.embedding.weight
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embedding(input_ids)

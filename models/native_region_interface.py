@@ -13,6 +13,13 @@ from backbones.general import BackboneSpec, build_backbone_stack, _make_final_no
 _INTERFACE_JACOBIAN_NOTICE = {"batched_vjp_fallback": False}
 _VALID_MESSAGE_ABLATIONS = {"none", "zero_all", "noise", "mask"}
 
+# Paper LBI model path:
+#   NativeRegionInterfaceModel.forward_with_cache builds the regionized forward pass.
+#   train/train_region_interface.py then calls materialize_interface_pullback_mats
+#   and interface_vjp_scan_from_last_input_seed for the scan-based backward pass.
+# Graph-mode materialization and interface_vjp_chain are reference/debug paths;
+# paper launcher defaults use recompute mode for Mamba/Transformer-scale runs.
+
 
 def _report_interface_jacobian_notice(kind: str, message: str) -> None:
     if _INTERFACE_JACOBIAN_NOTICE.get(kind, False):
@@ -36,6 +43,8 @@ def build_region_slices(layers: int, region_size: int) -> List[Tuple[int, int]]:
 
 
 class RegionMessageHead(nn.Module):
+    """Encoder/decoder map for the bounded inter-region message."""
+
     def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 0):
         super().__init__()
         if hidden_dim > 0:
@@ -80,7 +89,11 @@ class RegionInterfaceCache:
 
 
 class NativeRegionInterfaceModel(nn.Module):
-    """Regionized dense Mamba with a bounded residual message interface between regions."""
+    """Regionized LM with a bounded residual message interface between layer regions.
+
+    Paper terminology: `message_dim` is the interface rank r, and `region_size`
+    is the number of backbone layers per region.
+    """
 
     def __init__(
         self,
@@ -91,12 +104,14 @@ class NativeRegionInterfaceModel(nn.Module):
         backbone_spec: BackboneSpec,
         message_hidden_dim: int = 0,
         message_scale_init: float = 0.5,
+        tie_embeddings: bool = False,
     ):
         super().__init__()
         backbone_spec.validate()
         self.dim = backbone_spec.dim
         self.layers = backbone_spec.layers
         self.message_dim = message_dim
+        self.tie_embeddings = bool(tie_embeddings)
         self.region_ranges = build_region_slices(layers=backbone_spec.layers, region_size=region_size)
         self.n_regions = len(self.region_ranges)
 
@@ -125,12 +140,32 @@ class NativeRegionInterfaceModel(nn.Module):
                 if layer_type == "transformer":
                     init_transformer_module(block, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
             init_transformer_module(self.lm_head, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
+        if self.tie_embeddings:
+            nn.init.normal_(self.embedding.weight, std=0.02)
+            self.lm_head.weight = self.embedding.weight
 
     def _pool_hidden(self, x: torch.Tensor) -> torch.Tensor:
         pooled = x.mean(dim=1)
         if pooled.dtype != x.dtype:
             pooled = pooled.to(dtype=x.dtype)
         return pooled
+
+    def _forward_region_message_map(
+        self,
+        ridx: int,
+        x_static: torch.Tensor,
+        m_in: torch.Tensor,
+    ) -> torch.Tensor:
+        """Local map F_k: m_k -> m_{k+1} used by recompute-mode interface Jacobians."""
+        start, end = self.region_ranges[ridx]
+        hidden_bias = self.message_to_hidden[ridx](m_in)
+        x_in = x_static + hidden_bias.unsqueeze(1)
+        x_out = self.backbone.forward_range(x_in, start, end)
+        pooled_hidden = self._pool_hidden(x_out)
+        delta_m = self.hidden_to_message[ridx](pooled_hidden)
+        alpha = torch.tanh(self.message_alpha[ridx])
+        pre_norm_message = m_in + alpha * delta_m
+        return self.message_norm[ridx](pre_norm_message)
 
     def _apply_message_ablation(
         self,
@@ -171,6 +206,13 @@ class NativeRegionInterfaceModel(nn.Module):
         message_mask_keep_prob: float = 0.5,
         ablation_generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, Dict[str, Any]]:
+        """Active LBI forward pass used by training and evaluation.
+
+        Each region is rebuilt from the static token canvas plus the current
+        bounded message; no dense hidden activation is carried between regions.
+        The returned cache contains the local tensors needed to materialize
+        interface pullbacks during the custom backward step.
+        """
         x_static = self.embedding(input_ids)
         pooled0 = self._pool_hidden(x_static)
         m = self.input_to_message(pooled0)
@@ -413,7 +455,7 @@ class NativeRegionInterfaceModel(nn.Module):
         }
 
     def interface_vjp_chain(self, cache: Dict[str, Any], g_top_message: torch.Tensor) -> List[torch.Tensor]:
-        """Reference region-message pullback chain (sequential over regions)."""
+        """Reference/debug sequential region-message pullback chain."""
         region_messages: Sequence[torch.Tensor] = cache["region_messages"]
         if len(region_messages) != self.n_regions + 1:
             raise ValueError("cache has invalid region_messages length.")
@@ -431,8 +473,8 @@ class NativeRegionInterfaceModel(nn.Module):
             g_msgs[ridx] = g_prev
         return g_msgs
 
-    def materialize_interface_pullback_mats(self, cache: Dict[str, Any]) -> List[torch.Tensor]:
-        """Materialize per-region pullback matrices A_k^T where g_k = A_k^T g_{k+1}."""
+    def _materialize_interface_pullback_mats_graph(self, cache: Dict[str, Any]) -> List[torch.Tensor]:
+        """Reference graph-mode local pullbacks A_k^T where g_k = A_k^T g_{k+1}."""
         region_messages: Sequence[torch.Tensor] = cache["region_messages"]
         if len(region_messages) != self.n_regions + 1:
             raise ValueError("cache has invalid region_messages length.")
@@ -478,8 +520,91 @@ class NativeRegionInterfaceModel(nn.Module):
                 mats.append(torch.cat(cols, dim=-1))
         return mats
 
+    def _materialize_interface_pullback_mats_recompute(
+        self,
+        cache: Dict[str, Any],
+        *,
+        basis_chunk: int,
+    ) -> List[torch.Tensor]:
+        """Materialize local interface matrices by detached region-local recomputation.
+
+        This computes the same local A_k^T = dF_k(m_k)^T/dm_k as the graph path,
+        but removes chain dependencies by rebuilding each region map from cached
+        boundary values. Chunking uses an expanded batch so it does not rely on
+        autograd's batched-VJP path, which is incompatible with some custom ops.
+        """
+        if basis_chunk <= 0:
+            raise ValueError("basis_chunk must be > 0.")
+        region_caches: Sequence[RegionForwardCache] = cache["region_caches"]
+        if len(region_caches) != self.n_regions:
+            raise ValueError("cache has invalid region_caches length.")
+
+        mats: List[torch.Tensor] = []
+        for region_cache in region_caches:
+            ridx = region_cache.region_idx
+            m_base = region_cache.message_in.detach()
+            x_static_base = region_cache.x_static.detach()
+            if m_base.dim() != 2:
+                raise ValueError("region message inputs must be [B, R].")
+            if x_static_base.dim() != 3:
+                raise ValueError("x_static must be [B, L, D].")
+            bsz, rank = m_base.shape
+            if x_static_base.shape[0] != bsz:
+                raise ValueError("x_static and message batch sizes do not match.")
+
+            eye = torch.eye(rank, device=m_base.device, dtype=m_base.dtype)
+            cols: List[torch.Tensor] = []
+            for start in range(0, rank, basis_chunk):
+                basis = eye[start : start + basis_chunk]
+                chunk = int(basis.shape[0])
+                m_rep = (
+                    m_base.unsqueeze(0)
+                    .expand(chunk, bsz, rank)
+                    .reshape(chunk * bsz, rank)
+                    .contiguous()
+                    .requires_grad_(True)
+                )
+                x_static_rep = (
+                    x_static_base.unsqueeze(0)
+                    .expand(chunk, *x_static_base.shape)
+                    .reshape(chunk * bsz, x_static_base.shape[1], x_static_base.shape[2])
+                    .contiguous()
+                )
+                m_out_rep = self._forward_region_message_map(ridx, x_static_rep, m_rep)
+                grad_out = (
+                    basis.unsqueeze(1)
+                    .expand(chunk, bsz, rank)
+                    .reshape(chunk * bsz, rank)
+                    .to(device=m_out_rep.device, dtype=m_out_rep.dtype)
+                )
+                grad_in = torch.autograd.grad(
+                    m_out_rep,
+                    m_rep,
+                    grad_outputs=grad_out,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=False,
+                )[0]
+                cols.append(grad_in.reshape(chunk, bsz, rank).permute(1, 2, 0).contiguous())
+            mats.append(torch.cat(cols, dim=-1).to(device=m_base.device, dtype=m_base.dtype))
+        return mats
+
+    def materialize_interface_pullback_mats(
+        self,
+        cache: Dict[str, Any],
+        *,
+        mode: str = "graph",
+        basis_chunk: int = 1,
+    ) -> List[torch.Tensor]:
+        """Materialize local interface pullbacks for the active scan-based backward path."""
+        if mode == "graph":
+            return self._materialize_interface_pullback_mats_graph(cache)
+        if mode == "recompute":
+            return self._materialize_interface_pullback_mats_recompute(cache, basis_chunk=basis_chunk)
+        raise ValueError("interface Jacobian mode must be one of: graph, recompute")
+
     def compose_pullback_suffix(self, interface_pullback_mats: Sequence[torch.Tensor]) -> List[torch.Tensor]:
-        """Suffix products S_k = A_k^T ... A_{K-1}^T with S_K = I."""
+        """Active CUDA suffix scan: S_k = A_k^T ... A_{K-1}^T with S_K = I."""
         count = len(interface_pullback_mats)
         if count == 0:
             return []
@@ -514,7 +639,7 @@ class NativeRegionInterfaceModel(nn.Module):
         interface_pullback_mats: Sequence[torch.Tensor],
         g_top_message: torch.Tensor,
     ) -> List[torch.Tensor]:
-        """Apply suffix-composed pullback summaries to top message gradient."""
+        """Apply suffix-composed pullback summaries to a top-message gradient."""
         count = len(interface_pullback_mats)
         suffix = self.compose_pullback_suffix(interface_pullback_mats)
         if len(suffix) != count + 1:
@@ -528,9 +653,16 @@ class NativeRegionInterfaceModel(nn.Module):
         g_msgs.append(g_top_message)
         return g_msgs
 
-    def interface_vjp_scan(self, cache: Dict[str, Any], g_top_message: torch.Tensor) -> List[torch.Tensor]:
-        """Region pullback via materialized interface summaries + suffix composition."""
-        mats = self.materialize_interface_pullback_mats(cache)
+    def interface_vjp_scan(
+        self,
+        cache: Dict[str, Any],
+        g_top_message: torch.Tensor,
+        *,
+        mode: str = "graph",
+        basis_chunk: int = 1,
+    ) -> List[torch.Tensor]:
+        """Convenience wrapper for full top-message VJP scans; used for debugging."""
+        mats = self.materialize_interface_pullback_mats(cache, mode=mode, basis_chunk=basis_chunk)
         return self.interface_vjp_scan_from_mats(mats, g_top_message)
 
     def interface_vjp_scan_from_last_input_seed(
@@ -539,7 +671,7 @@ class NativeRegionInterfaceModel(nn.Module):
         g_last_input_message: torch.Tensor,
     ) -> List[torch.Tensor]:
         """
-        Scan message adjoints with seed at m_{K-1} (last region input message).
+        Active paper backward scan with seed at m_{K-1} (last region input message).
 
         Returns [g_{m0}, ..., g_{m_{K-1}}].
         """

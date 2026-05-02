@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 from backbones.general import BackboneSpec, ReferenceLM, infer_message_hidden_dim
 from data.bpe_tokenizer import build_token_stream, load_text_tokenizer
-from data.data_paths import CORPORA_ROOT, LLAMA31_TOKENIZER_ROOT, TOKENIZERS_ROOT
+from data.data_paths import CORPORA_ROOT, LLAMA31_TOKENIZER_ROOT, LLAMA_TOKENIZER_ROOT, TOKENIZERS_ROOT
 from data.lm_data import build_byte_stream, sample_batch_stream, split_stream_train_val
 from data.token_shards import TokenShardCorpus, corpus_numel, sample_batch_token_shards
 from data.train_data import build_synthetic_corpus, sample_batch
@@ -32,11 +32,18 @@ _BUNDLED_TEXT_CORPORA: Dict[str, tuple[str, str]] = {
 
 _EVAL_MESSAGE_ABLATION_MODES = ("zero_all", "noise", "mask")
 
+# Paper workflow entry path:
+#   scripts/train_dense_paper.sh -> regime=backprop_ref -> _run_reference_backprop
+#   scripts/train_lbi_paper.sh   -> regime=native_region_interface -> _run_native_region_interface
+#   scripts/evaluate_paper_checkpoints.sh reloads the same configs/checkpoints for post-hoc CE.
+# The lower-level flags remain broad for debugging and ablations; paper reproduction should use the wrappers.
+
 
 @dataclass
 class NativeBackwardResult:
     grad_map: Dict[str, torch.Tensor | None]
     interface_scan_rms: float
+    interface_jacobian_stats: Dict[str, float] | None = None
 
 
 @dataclass
@@ -64,6 +71,7 @@ class RegionInterfaceConfig:
     train_tokenizer: bool = False
     tokenizer_train_bytes: int = 8 * 1024 * 1024
     vocab_size: int = 256
+    tie_embeddings: bool = False
     seq_len: int = 64
     train_sequences: int = 2048
     val_sequences: int = 256
@@ -72,7 +80,7 @@ class RegionInterfaceConfig:
     eval_every: int = 20
     eval_batches: int = 4
     log_every: int = 5
-    save_every: int = 100
+    save_every: int = 5000
     save_checkpoints: bool = True
     lr_model: float = 1e-3
     lr_schedule: str = "constant"  # constant | cosine | linear
@@ -106,6 +114,10 @@ class RegionInterfaceConfig:
     message_dim: int = 64
     message_hidden_dim: int = 0
     message_scale_init: float = 0.5
+    interface_jacobian_mode: str = "graph"
+    jacobian_basis_chunk: int = 1
+    log_interface_jacobian_every: int = 0
+    log_interface_jacobian_suffix: bool = False
     eval_message_ablation: str = "none"
     eval_all_message_ablations: bool = False
     message_noise_std: float = 1.0
@@ -118,7 +130,7 @@ class RegionInterfaceConfig:
         return asdict(self)
 
 
-# Temporary compatibility alias while the new repo settles.
+# Temporary compatibility aliases.
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train bounded region interfaces on a dense Mamba backbone.")
     p.add_argument("--regime", type=str, default="all")
@@ -144,6 +156,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--train-tokenizer", action="store_true")
     p.add_argument("--tokenizer-train-bytes", type=int, default=8 * 1024 * 1024)
     p.add_argument("--vocab-size", type=int, default=256)
+    p.add_argument("--tie-embeddings", dest="tie_embeddings", action="store_true")
+    p.add_argument("--no-tie-embeddings", dest="tie_embeddings", action="store_false")
+    p.set_defaults(tie_embeddings=False)
     p.add_argument("--seq-len", type=int, default=64)
     p.add_argument("--train-sequences", type=int, default=2048)
     p.add_argument("--val-sequences", type=int, default=256)
@@ -152,7 +167,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-every", type=int, default=20)
     p.add_argument("--eval-batches", type=int, default=4)
     p.add_argument("--log-every", type=int, default=5)
-    p.add_argument("--save-every", type=int, default=100)
+    p.add_argument("--save-every", type=int, default=5000)
     p.add_argument("--save-checkpoints", dest="save_checkpoints", action="store_true")
     p.add_argument("--no-save-checkpoints", dest="save_checkpoints", action="store_false")
     p.set_defaults(save_checkpoints=True)
@@ -197,6 +212,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--message-dim", type=int, default=64)
     p.add_argument("--message-hidden-dim", type=int, default=0)
     p.add_argument("--message-scale-init", type=float, default=0.5)
+    p.add_argument("--interface-jacobian-mode", type=str, default="graph")
+    p.add_argument("--jacobian-basis-chunk", type=int, default=1)
+    p.add_argument("--log-interface-jacobian-every", type=int, default=0)
+    p.add_argument("--log-interface-jacobian-suffix", action="store_true")
     p.add_argument("--eval-message-ablation", type=str, default="none")
     p.add_argument("--eval-all-message-ablations", action="store_true")
     p.add_argument("--message-noise-std", type=float, default=1.0)
@@ -204,6 +223,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+# Enumerate all invalid configurations.
 def _validate_cfg(cfg: RegionInterfaceConfig) -> None:
     if cfg.regime not in {"backprop_ref", "native_region_interface", "all"}:
         raise ValueError("regime must be one of: backprop_ref, native_region_interface, all")
@@ -223,8 +243,8 @@ def _validate_cfg(cfg: RegionInterfaceConfig) -> None:
         if not (0.0 < cfg.val_split < 1.0):
             raise ValueError("val_split must be in (0,1)")
     if cfg.data_mode in {"text_bpe", "text_bpe_sharded"}:
-        if cfg.tokenizer_type not in {"sentencepiece", "llama31"}:
-            raise ValueError("tokenizer_type must be one of: sentencepiece, llama31")
+        if cfg.tokenizer_type not in {"sentencepiece", "llama", "llama31"}:
+            raise ValueError("tokenizer_type must be one of: sentencepiece, llama, llama31")
         if cfg.tokenizer_type == "sentencepiece" and cfg.vocab_size <= 256:
             raise ValueError(f"{cfg.data_mode} mode requires vocab_size > 256")
         if cfg.data_mode == "text_bpe":
@@ -232,8 +252,8 @@ def _validate_cfg(cfg: RegionInterfaceConfig) -> None:
                 raise ValueError("tokenizer_train_bytes must be > 0")
             if not (0.0 < cfg.val_split < 1.0):
                 raise ValueError("val_split must be in (0,1)")
-        if cfg.tokenizer_type == "llama31" and cfg.train_tokenizer:
-            raise ValueError("llama31 tokenizer does not support --train-tokenizer")
+        if cfg.tokenizer_type in {"llama", "llama31"} and cfg.train_tokenizer:
+            raise ValueError(f"{cfg.tokenizer_type} tokenizer does not support --train-tokenizer")
     if cfg.data_mode != "synthetic" and (not cfg.train_text_path) and cfg.text_corpus not in _BUNDLED_TEXT_CORPORA:
         allowed = ", ".join(sorted(_BUNDLED_TEXT_CORPORA.keys()))
         raise ValueError(f"text_corpus must be one of: {allowed} when train_text_path is not set")
@@ -269,6 +289,12 @@ def _validate_cfg(cfg: RegionInterfaceConfig) -> None:
         raise ValueError("message_hidden_dim must be >= 0.")
     if cfg.message_scale_init <= 0.0:
         raise ValueError("message_scale_init must be > 0.")
+    if cfg.interface_jacobian_mode not in {"graph", "recompute"}:
+        raise ValueError("interface_jacobian_mode must be one of: graph, recompute")
+    if cfg.jacobian_basis_chunk <= 0:
+        raise ValueError("jacobian_basis_chunk must be > 0.")
+    if cfg.log_interface_jacobian_every < 0:
+        raise ValueError("log_interface_jacobian_every must be >= 0.")
     if cfg.eval_message_ablation not in {"none", *_EVAL_MESSAGE_ABLATION_MODES}:
         raise ValueError("eval_message_ablation must be one of: none, zero_all, noise, mask")
     if cfg.message_noise_std < 0.0:
@@ -315,6 +341,7 @@ def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
         train_tokenizer=args.train_tokenizer,
         tokenizer_train_bytes=args.tokenizer_train_bytes,
         vocab_size=args.vocab_size,
+        tie_embeddings=args.tie_embeddings,
         seq_len=args.seq_len,
         train_sequences=args.train_sequences,
         val_sequences=args.val_sequences,
@@ -357,6 +384,10 @@ def _from_args(args: argparse.Namespace) -> RegionInterfaceConfig:
         message_dim=args.message_dim,
         message_hidden_dim=args.message_hidden_dim,
         message_scale_init=args.message_scale_init,
+        interface_jacobian_mode=args.interface_jacobian_mode,
+        jacobian_basis_chunk=args.jacobian_basis_chunk,
+        log_interface_jacobian_every=args.log_interface_jacobian_every,
+        log_interface_jacobian_suffix=args.log_interface_jacobian_suffix,
         eval_message_ablation=args.eval_message_ablation,
         eval_all_message_ablations=args.eval_all_message_ablations,
         message_noise_std=args.message_noise_std,
@@ -442,6 +473,13 @@ def _resolve_text_paths(cfg: RegionInterfaceConfig) -> tuple[Path, Path | None, 
 def _resolve_tokenizer_path(cfg: RegionInterfaceConfig, *, train_path: Path) -> Path:
     if cfg.tokenizer_path:
         return Path(cfg.tokenizer_path)
+    if cfg.tokenizer_type == "llama":
+        legacy = TOKENIZERS_ROOT / "llama"
+        if LLAMA_TOKENIZER_ROOT.exists():
+            return LLAMA_TOKENIZER_ROOT
+        if legacy.exists():
+            return legacy
+        return LLAMA_TOKENIZER_ROOT
     if cfg.tokenizer_type == "llama31":
         legacy = TOKENIZERS_ROOT / "llama31"
         if LLAMA31_TOKENIZER_ROOT.exists():
@@ -455,7 +493,10 @@ def _resolve_tokenizer_path(cfg: RegionInterfaceConfig, *, train_path: Path) -> 
 
 
 def _resolve_token_shards_dir(cfg: RegionInterfaceConfig, *, train_path: Path) -> Path:
-    tag = "llama31" if cfg.tokenizer_type == "llama31" else f"sp_bpe_{cfg.vocab_size}"
+    if cfg.tokenizer_type in {"llama", "llama31"}:
+        tag = cfg.tokenizer_type
+    else:
+        tag = f"sp_bpe_{cfg.vocab_size}"
     if cfg.token_shards_dir:
         return Path(cfg.token_shards_dir)
     if not cfg.train_text_path:
@@ -469,7 +510,7 @@ def _resolve_token_shard_manifests(cfg: RegionInterfaceConfig, *, train_path: Pa
 
 
 def _resolve_runtime_vocab_size(cfg: RegionInterfaceConfig) -> int:
-    if cfg.data_mode not in {"text_bpe", "text_bpe_sharded"} or cfg.tokenizer_type != "llama31":
+    if cfg.data_mode not in {"text_bpe", "text_bpe_sharded"} or cfg.tokenizer_type not in {"llama", "llama31"}:
         return int(cfg.vocab_size)
     train_path, _, _ = _resolve_text_paths(cfg)
     tokenizer_path = _resolve_tokenizer_path(cfg, train_path=train_path)
@@ -484,7 +525,7 @@ def _resolve_runtime_vocab_size(cfg: RegionInterfaceConfig) -> int:
     actual_vocab_size = int(tokenizer.vocab_size)
     if cfg.vocab_size != actual_vocab_size:
         print(
-            f"[tokenizer] overriding vocab_size from {cfg.vocab_size} to llama31 tokenizer vocab_size={actual_vocab_size} "
+            f"[tokenizer] overriding vocab_size from {cfg.vocab_size} to {cfg.tokenizer_type} tokenizer vocab_size={actual_vocab_size} "
             f"from {tokenizer_path}",
             flush=True,
         )
@@ -590,6 +631,12 @@ def _count_parameters(module: nn.Module) -> int:
     return int(sum(p.numel() for p in module.parameters()))
 
 
+def _lm_head_component_params(model: nn.Module) -> int:
+    if getattr(model, "tie_embeddings", False) and model.lm_head.weight is model.embedding.weight:
+        return 0
+    return _count_parameters(model.lm_head)
+
+
 def _infer_data_info(
     cfg: RegionInterfaceConfig,
     *,
@@ -644,28 +691,50 @@ def _infer_model_info(cfg: RegionInterfaceConfig, *, model: nn.Module) -> Dict[s
         "dim": int(cfg.dim),
         "d_state": int(cfg.d_state),
         "dt_rank": cfg.dt_rank if cfg.dt_rank is not None else "auto",
+        "tie_embeddings": bool(cfg.tie_embeddings),
     }
     if isinstance(model, NativeRegionInterfaceModel):
+        embedding_params = _count_parameters(model.embedding)
+        lm_head_params = _lm_head_component_params(model)
+        backbone_params = int(sum(_count_parameters(block) for block in model.blocks))
+        interface_params = int(
+            _count_parameters(model.input_to_message)
+            + sum(_count_parameters(mod) for mod in model.message_to_hidden)
+            + sum(_count_parameters(mod) for mod in model.hidden_to_message)
+            + sum(_count_parameters(mod) for mod in model.message_norm)
+            + model.message_alpha.numel()
+        )
         info["n_regions"] = int(model.n_regions)
         info["region_ranges"] = [list(pair) for pair in model.region_ranges]
+        info["backbone_params"] = backbone_params
+        info["tokenizer_params"] = embedding_params + lm_head_params
+        info["interface_params"] = interface_params
         info["component_params"] = {
-            "embedding": _count_parameters(model.embedding),
-            "blocks": int(sum(_count_parameters(block) for block in model.blocks)),
+            "embedding": embedding_params,
+            "blocks": backbone_params,
             "input_to_message": _count_parameters(model.input_to_message),
             "message_to_hidden": int(sum(_count_parameters(mod) for mod in model.message_to_hidden)),
             "hidden_to_message": int(sum(_count_parameters(mod) for mod in model.hidden_to_message)),
             "message_norm": int(sum(_count_parameters(mod) for mod in model.message_norm)),
             "message_alpha": int(model.message_alpha.numel()),
             "norm": _count_parameters(model.norm),
-            "lm_head": _count_parameters(model.lm_head),
+            "lm_head": lm_head_params,
         }
+        info["lm_head_tied_to_embedding"] = bool(model.lm_head.weight is model.embedding.weight)
     elif isinstance(model, ReferenceLM):
+        embedding_params = _count_parameters(model.embedding)
+        lm_head_params = _lm_head_component_params(model)
+        backbone_params = int(sum(_count_parameters(block) for block in model.blocks))
+        info["backbone_params"] = backbone_params
+        info["tokenizer_params"] = embedding_params + lm_head_params
+        info["interface_params"] = 0
         info["component_params"] = {
-            "embedding": _count_parameters(model.embedding),
-            "blocks": int(sum(_count_parameters(block) for block in model.blocks)),
+            "embedding": embedding_params,
+            "blocks": backbone_params,
             "norm": _count_parameters(model.norm),
-            "lm_head": _count_parameters(model.lm_head),
+            "lm_head": lm_head_params,
         }
+        info["lm_head_tied_to_embedding"] = bool(model.lm_head.weight is model.embedding.weight)
     return info
 
 
@@ -696,6 +765,13 @@ def _write_csv(path: Path, row: Dict[str, Any]) -> None:
         "ce_loss",
         "message_norm",
         "scan_align",
+        "jac_local_spec_mean",
+        "jac_local_spec_max",
+        "jac_local_frob_mean",
+        "jac_local_frob_max",
+        "jac_local_frob_normed_mean",
+        "jac_suffix_spec_mean",
+        "jac_suffix_spec_max",
         "tokens_per_s",
         "wall_time_s",
     ]
@@ -956,6 +1032,7 @@ def _evaluate_reference(
     generator: torch.Generator,
     device: torch.device,
 ) -> Dict[str, float]:
+    """Online/post-hoc CE evaluator for dense backprop_ref runs."""
     model.eval()
     losses: list[float] = []
     with torch.no_grad():
@@ -984,6 +1061,7 @@ def _evaluate_native(
     message_ablation: str = "none",
     ablation_generator: torch.Generator | None = None,
 ) -> Dict[str, float]:
+    """Online/post-hoc CE evaluator for LBI runs, with optional message ablations."""
     model.eval()
     losses: list[float] = []
     with torch.no_grad():
@@ -1041,12 +1119,57 @@ def _store_named_grads(
         grad_map[name] = None if grad is None else grad.detach().clone()
 
 
+def _interface_jacobian_stats(
+    model: NativeRegionInterfaceModel,
+    mats: list[torch.Tensor],
+    *,
+    include_suffix: bool,
+) -> Dict[str, float]:
+    """Optional appendix diagnostic computed from already-materialized interface pullbacks."""
+    if not mats:
+        return {}
+    with torch.no_grad():
+        dense = torch.stack([mat.detach().float() for mat in mats], dim=1)
+        frob = torch.linalg.matrix_norm(dense, ord="fro", dim=(-2, -1))
+        spec = torch.linalg.matrix_norm(dense, ord=2, dim=(-2, -1))
+        rank = max(1, int(dense.shape[-1]))
+        stats = {
+            "jac_local_spec_mean": float(spec.mean().item()),
+            "jac_local_spec_max": float(spec.max().item()),
+            "jac_local_frob_mean": float(frob.mean().item()),
+            "jac_local_frob_max": float(frob.max().item()),
+            "jac_local_frob_normed_mean": float((frob / math.sqrt(rank)).mean().item()),
+        }
+        if include_suffix:
+            suffix = model.compose_pullback_suffix(mats)
+            suffix_dense = torch.stack([mat.detach().float() for mat in suffix], dim=1)
+            suffix_spec = torch.linalg.matrix_norm(suffix_dense, ord=2, dim=(-2, -1))
+            stats.update(
+                {
+                    "jac_suffix_spec_mean": float(suffix_spec.mean().item()),
+                    "jac_suffix_spec_max": float(suffix_spec.max().item()),
+                }
+            )
+        return stats
+
+
 def _native_backward_step(
     model: NativeRegionInterfaceModel,
     *,
     ce_loss: torch.Tensor,
     cache: Dict[str, Any],
+    interface_jacobian_mode: str = "graph",
+    jacobian_basis_chunk: int = 1,
+    interface_recompute_context: Any | None = None,
+    compute_interface_jacobian_stats: bool = False,
+    include_interface_jacobian_suffix: bool = False,
 ) -> NativeBackwardResult:
+    """Active LBI paper backward path.
+
+    The forward graph is regionized. This function materializes local message
+    pullbacks, composes them with the suffix scan, and assigns parameter
+    gradients without dense cross-region activation backpropagation.
+    """
     param_name_map = {id(param): name for name, param in model.named_parameters() if param.requires_grad}
     grad_map: Dict[str, torch.Tensor | None] = {
         name: None for name, param in model.named_parameters() if param.requires_grad
@@ -1058,7 +1181,10 @@ def _native_backward_step(
     if n_regions == 0:
         raise RuntimeError("native_region_interface requires at least one region.")
 
-    head_params = [p for p in list(model.norm.parameters()) + list(model.lm_head.parameters()) if p.requires_grad]
+    tied_lm_head = bool(getattr(model, "tie_embeddings", False) and model.lm_head.weight is model.embedding.weight)
+    head_params = [p for p in model.norm.parameters() if p.requires_grad]
+    if not tied_lm_head:
+        head_params.extend([p for p in model.lm_head.parameters() if p.requires_grad])
     head_grads = torch.autograd.grad(
         ce_loss,
         head_params,
@@ -1079,6 +1205,7 @@ def _native_backward_step(
             )[0].detach().to(device=region_messages[0].device, dtype=region_messages[0].dtype)
         ]
         interface_scan_rms = 0.0
+        interface_jacobian_stats = None
     else:
         g_last_input = torch.autograd.grad(
             ce_loss,
@@ -1087,7 +1214,26 @@ def _native_backward_step(
             create_graph=False,
             allow_unused=False,
         )[0].detach()
-        mats = model.materialize_interface_pullback_mats(cache)
+        ctx = (
+            interface_recompute_context
+            if interface_jacobian_mode == "recompute" and interface_recompute_context is not None
+            else nullcontext()
+        )
+        with ctx:
+            mats = model.materialize_interface_pullback_mats(
+                cache,
+                mode=interface_jacobian_mode,
+                basis_chunk=jacobian_basis_chunk,
+            )
+        interface_jacobian_stats = (
+            _interface_jacobian_stats(
+                model,
+                list(mats),
+                include_suffix=include_interface_jacobian_suffix,
+            )
+            if compute_interface_jacobian_stats
+            else None
+        )
         g_last_input = g_last_input.to(device=mats[0].device, dtype=mats[0].dtype)
         g_msg_inputs = model.interface_vjp_scan_from_last_input_seed(mats, g_last_input)
         g_manual = [torch.zeros_like(g_last_input) for _ in range(n_regions)]
@@ -1144,22 +1290,32 @@ def _native_backward_step(
         allow_unused=True,
     )
     _store_named_grads(grad_map, param_name_map, shared_params, shared_grads)
-    return NativeBackwardResult(grad_map=grad_map, interface_scan_rms=interface_scan_rms)
+    return NativeBackwardResult(
+        grad_map=grad_map,
+        interface_scan_rms=interface_scan_rms,
+        interface_jacobian_stats=interface_jacobian_stats,
+    )
 
 
 def _autograd_backward_step(model: nn.Module, *, ce_loss: torch.Tensor) -> Dict[str, torch.Tensor | None]:
+    """Dense/reference autograd path used by backprop_ref baselines."""
     model.zero_grad(set_to_none=True)
     ce_loss.backward()
     return _collect_named_grads(model)
 
 
 def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dict[str, Any]:
+    """Paper dense baseline training loop."""
     device = _resolve_device(cfg)
     torch.manual_seed(cfg.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(cfg.seed)
 
-    model = ReferenceLM(vocab_size=cfg.vocab_size, backbone_spec=_make_backbone_spec(cfg)).to(device=device, dtype=torch.float32)
+    model = ReferenceLM(
+        vocab_size=cfg.vocab_size,
+        backbone_spec=_make_backbone_spec(cfg),
+        tie_embeddings=cfg.tie_embeddings,
+    ).to(device=device, dtype=torch.float32)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr_model, weight_decay=cfg.weight_decay)
     train_corpus, val_corpus = _build_corpora(cfg, device=device)
     _write_run_metadata(cfg=cfg, run_dir=run_dir, model=model, train_corpus=train_corpus, val_corpus=val_corpus)
@@ -1284,21 +1440,6 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
                 f.write(json.dumps(val_row, sort_keys=True) + "\n")
 
         if cfg.save_checkpoints and ((step % cfg.save_every) == 0 or step == cfg.steps):
-            _save_checkpoint(
-                run_dir=run_dir,
-                filename=f"step_{step:07d}.pt",
-                model=model,
-                optimizer=optimizer,
-                cfg=cfg,
-                device=device,
-                train_generator=train_gen,
-                eval_generator=eval_gen,
-                step=step,
-                tokens_seen=total_train_tokens,
-                best_val_ce_loss=best_val,
-                best_val_step=best_val_step,
-                extra={"regime": "backprop_ref", "train_ce_loss": final_train},
-            )
             latest_path = _save_checkpoint(
                 run_dir=run_dir,
                 filename="latest.pt",
@@ -1339,6 +1480,7 @@ def _run_reference_backprop(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dic
 
 
 def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -> Dict[str, Any]:
+    """Paper LBI training loop."""
     device = _resolve_device(cfg)
     torch.manual_seed(cfg.seed)
     if device.type == "cuda":
@@ -1352,6 +1494,7 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
         backbone_spec=backbone_spec,
         message_hidden_dim=infer_message_hidden_dim(backbone_spec, cfg.message_hidden_dim),
         message_scale_init=cfg.message_scale_init,
+        tie_embeddings=cfg.tie_embeddings,
     ).to(device=device, dtype=torch.float32)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr_model, weight_decay=cfg.weight_decay)
     train_corpus, val_corpus = _build_corpora(cfg, device=device)
@@ -1382,6 +1525,7 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
     final_eval_message_ablations: Dict[str, float] = {}
     best_checkpoint_path = ""
     latest_checkpoint_path = ""
+    final_interface_jacobian_stats: Dict[str, float] = {}
     train_tokens_per_step = int(cfg.batch_size * cfg.seq_len)
     total_train_tokens = int(restore["tokens_seen"])
     start_step = int(restore["start_step"])
@@ -1404,9 +1548,24 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
             logits, cache = model.forward_with_cache(xb)
         ce_loss = _next_token_loss(logits, yb)
         optimizer.zero_grad(set_to_none=True)
-        backward_result = _native_backward_step(model, ce_loss=ce_loss, cache=cache)
+        log_interface_jacobian = (
+            cfg.log_interface_jacobian_every > 0
+            and ((step % cfg.log_interface_jacobian_every) == 0 or step == 1 or step == cfg.steps)
+        )
+        backward_result = _native_backward_step(
+            model,
+            ce_loss=ce_loss,
+            cache=cache,
+            interface_jacobian_mode=cfg.interface_jacobian_mode,
+            jacobian_basis_chunk=cfg.jacobian_basis_chunk,
+            interface_recompute_context=_autocast_context(cfg, device),
+            compute_interface_jacobian_stats=log_interface_jacobian,
+            include_interface_jacobian_suffix=cfg.log_interface_jacobian_suffix,
+        )
         _assign_grad_map(model, backward_result.grad_map)
         interface_scan_rms = backward_result.interface_scan_rms
+        if backward_result.interface_jacobian_stats is not None:
+            final_interface_jacobian_stats = dict(backward_result.interface_jacobian_stats)
 
         if cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -1427,7 +1586,9 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
             "tokens_per_s": float(train_tokens_per_step / max(1e-9, (t1 - t0))),
             "wall_time_s": float(t1 - t0),
         }
-        if (step % cfg.log_every) == 0 or step == 1:
+        if backward_result.interface_jacobian_stats is not None:
+            row.update(backward_result.interface_jacobian_stats)
+        if (step % cfg.log_every) == 0 or step == 1 or log_interface_jacobian:
             _write_csv(metrics_csv, row)
             with metrics_jsonl.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row, sort_keys=True) + "\n")
@@ -1466,6 +1627,9 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
                                 "train_ce_loss": final_train,
                                 "val_ce_loss": final_val,
                                 "interface_scan_rms": interface_scan_rms,
+                                "interface_jacobian_mode": cfg.interface_jacobian_mode,
+                                "jacobian_basis_chunk": cfg.jacobian_basis_chunk,
+                                "interface_jacobian_stats": final_interface_jacobian_stats,
                                 "is_best": True,
                             },
                         )
@@ -1516,25 +1680,6 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
                     f.write(json.dumps(ablation_row, sort_keys=True) + "\n")
 
         if cfg.save_checkpoints and ((step % cfg.save_every) == 0 or step == cfg.steps):
-            _save_checkpoint(
-                run_dir=run_dir,
-                filename=f"step_{step:07d}.pt",
-                model=model,
-                optimizer=optimizer,
-                cfg=cfg,
-                device=device,
-                train_generator=train_gen,
-                eval_generator=eval_gen,
-                step=step,
-                tokens_seen=total_train_tokens,
-                best_val_ce_loss=best_val,
-                best_val_step=best_val_step,
-                extra={
-                    "regime": "native_region_interface",
-                    "train_ce_loss": final_train,
-                    "interface_scan_rms": interface_scan_rms,
-                },
-            )
             latest_path = _save_checkpoint(
                 run_dir=run_dir,
                 filename="latest.pt",
@@ -1552,6 +1697,9 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
                     "regime": "native_region_interface",
                     "train_ce_loss": final_train,
                     "interface_scan_rms": interface_scan_rms,
+                    "interface_jacobian_mode": cfg.interface_jacobian_mode,
+                    "jacobian_basis_chunk": cfg.jacobian_basis_chunk,
+                    "interface_jacobian_stats": final_interface_jacobian_stats,
                 },
             )
             latest_checkpoint_path = str(latest_path)
@@ -1568,6 +1716,11 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
         "train_tokens_per_step": train_tokens_per_step,
         "total_train_tokens": total_train_tokens,
         "save_checkpoints": bool(cfg.save_checkpoints),
+        "interface_jacobian_mode": cfg.interface_jacobian_mode,
+        "jacobian_basis_chunk": int(cfg.jacobian_basis_chunk),
+        "log_interface_jacobian_every": int(cfg.log_interface_jacobian_every),
+        "log_interface_jacobian_suffix": bool(cfg.log_interface_jacobian_suffix),
+        "final_interface_jacobian_stats": final_interface_jacobian_stats,
         "best_checkpoint_path": best_checkpoint_path,
         "latest_checkpoint_path": latest_checkpoint_path,
         "final_eval_message_ablations": final_eval_message_ablations,
@@ -1580,6 +1733,7 @@ def _run_native_region_interface(cfg: RegionInterfaceConfig, *, run_dir: Path) -
 
 
 def run_training(cfg: RegionInterfaceConfig) -> Dict[str, Any]:
+    """Dispatch one configured run into the dense baseline, LBI path, or both."""
     cfg.vocab_size = _resolve_runtime_vocab_size(cfg)
     root_dir = _infer_existing_root_dir(cfg.resume_from) if cfg.resume_from else _prepare_run_dir(cfg, regime_root=cfg.regime)
     root_dir.mkdir(parents=True, exist_ok=True)
