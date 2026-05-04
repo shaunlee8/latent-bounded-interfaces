@@ -1,3 +1,5 @@
+# Portions adapted from state-spaces/mamba (https://github.com/state-spaces/mamba),
+# licensed under Apache-2.0. Modified for the bounded-interface/LBI experiments.
 from __future__ import annotations
 
 import torch

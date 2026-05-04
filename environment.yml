@@ -20,6 +20,7 @@ dependencies:
   - pip:
       - datasets
       - einops
+      - huggingface_hub
       - sentencepiece
       - transformers
       - triton

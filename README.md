@@ -9,7 +9,7 @@ This repository contains the code used for the bounded-interface/LBI language-mo
 
 The central implementation is `models/native_region_interface.py`. The paper training entrypoint is `train/train_region_interface.py`, but users should normally use the wrapper scripts in `scripts/`.
 
-## What Is Included
+## What's Included
 
 - supported backbone implementations under `backbones/`
 - bounded-interface model and native backward path under `models/`
@@ -24,6 +24,16 @@ Not included:
 - pretokenized token shards
 - LLaMA tokenizer files
 - checkpoints and generated `out/` results
+
+## Third-Party Code
+
+Portions of `backbones/mamba2/`, `backbones/mamba3/`, and `backbones/transformer/` are adapted from the official Mamba repository:
+
+```text
+https://github.com/state-spaces/mamba
+```
+
+The upstream Mamba code is licensed under Apache-2.0. See `THIRD_PARTY_NOTICES.md` and `third_party_licenses/mamba/LICENSE` for attribution and license details.
 
 ## Environment
 
@@ -45,11 +55,45 @@ The code expects PyTorch, Triton, einops, transformers, sentencepiece, datasets,
 
 ## Data And Tokenizer
 
-The canonical paper runs use FineWeb-Edu with the original 32k LLaMA tokenizer:
+Setting the dataset and tokenizer path:
 
 ```bash
 export LBI_DATA_ROOT=/path/to/lbi_data
-export LBI_LLAMA_TOKENIZER_ROOT=/path/to/llama-tokenizer
+export LBI_LLAMA_TOKENIZER_ROOT=${LBI_DATA_ROOT}/tokenizers/llama
+```
+
+The paper uses the original 32k LLaMA tokenizer. We do not redistribute tokenizer files. Reviewers should request access to the official Meta Llama 2 Hugging Face repository:
+
+https://huggingface.co/meta-llama/Llama-2-7b-hf
+
+After access is granted:
+
+```bash
+huggingface-cli login
+
+huggingface-cli download meta-llama/Llama-2-7b-hf \
+  --include "config.json" \
+  --include "tokenizer.*" \
+  --include "special_tokens_map.json" \
+  --include "tokenizer_config.json" \
+  --local-dir ${LBI_LLAMA_TOKENIZER_ROOT}
+```
+
+Validate the local tokenizer directory before pretokenizing:
+
+```bash
+python - <<'PY'
+import os
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained(
+    os.environ["LBI_LLAMA_TOKENIZER_ROOT"],
+    use_fast=True,
+    local_files_only=True,
+)
+print("vocab size:", len(tok))
+assert len(tok) == 32000
+PY
 ```
 
 Export the bounded FineWeb-Edu text subset:

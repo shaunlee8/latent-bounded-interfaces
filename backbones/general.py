@@ -132,7 +132,9 @@ class LayerwiseBackboneStack(BackboneStack):
         return x
 
 
-class Mamba2BackboneStack(BackboneStack):
+class ResidualBackboneStack(BackboneStack):
+    """Stack for blocks that thread upstream-style `(hidden_states, residual)` state."""
+
     def forward_range(self, x: torch.Tensor, start: int = 0, end: Optional[int] = None) -> torch.Tensor:
         end = len(self.blocks) if end is None else end
         hidden_states = x
@@ -260,7 +262,7 @@ def _build_mamba2_stack(spec: BackboneSpec) -> BackboneStack:
             for _ in range(spec.layers)
         ]
     )
-    return Mamba2BackboneStack(blocks)
+    return ResidualBackboneStack(blocks)
 
 
 def _build_mamba3_stack(spec: BackboneSpec) -> BackboneStack:
@@ -279,7 +281,7 @@ def _build_mamba3_stack(spec: BackboneSpec) -> BackboneStack:
             for _ in range(spec.layers)
         ]
     )
-    return Mamba2BackboneStack(blocks)
+    return ResidualBackboneStack(blocks)
 
 
 def _build_transformer_stack(spec: BackboneSpec) -> BackboneStack:
@@ -309,7 +311,7 @@ def _build_transformer_stack(spec: BackboneSpec) -> BackboneStack:
             for _ in range(spec.layers)
         ]
     )
-    return Mamba2BackboneStack(blocks)
+    return ResidualBackboneStack(blocks)
 
 
 def _make_hybrid_block(layer_type: str, spec: BackboneSpec) -> nn.Module:
@@ -366,4 +368,4 @@ def _make_hybrid_block(layer_type: str, spec: BackboneSpec) -> nn.Module:
 
 def _build_hybrid_stack(spec: BackboneSpec) -> BackboneStack:
     blocks = nn.ModuleList([_make_hybrid_block(layer_type, spec) for layer_type in spec.layer_types])
-    return Mamba2BackboneStack(blocks)
+    return ResidualBackboneStack(blocks)

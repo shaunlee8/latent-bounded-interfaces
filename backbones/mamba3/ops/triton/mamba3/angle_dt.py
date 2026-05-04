@@ -1,3 +1,5 @@
+# Adapted from state-spaces/mamba (https://github.com/state-spaces/mamba),
+# licensed under Apache-2.0.
 from typing import Tuple, Optional
 
 import torch

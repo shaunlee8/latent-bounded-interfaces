@@ -8,7 +8,7 @@ Set:
 
 ```bash
 export LBI_DATA_ROOT=/path/to/lbi_data
-export LBI_LLAMA_TOKENIZER_ROOT=/path/to/llama-tokenizer
+export LBI_LLAMA_TOKENIZER_ROOT=${LBI_DATA_ROOT}/tokenizers/llama
 ```
 
 The expected text layout is:
@@ -33,6 +33,42 @@ The tokenizer directory is not committed. It should be a local Hugging Face-comp
 - `TOKENIZER_TYPE=llama`
 - `VOCAB_SIZE=32000`
 - tied input/output embeddings
+
+The paper uses the original 32k LLaMA tokenizer. Reviewers should request access to the official Meta Llama 2 Hugging Face repository:
+
+```text
+https://huggingface.co/meta-llama/Llama-2-7b-hf
+```
+
+After access is granted:
+
+```bash
+huggingface-cli login
+
+huggingface-cli download meta-llama/Llama-2-7b-hf \
+  --include "config.json" \
+  --include "tokenizer.*" \
+  --include "special_tokens_map.json" \
+  --include "tokenizer_config.json" \
+  --local-dir ${LBI_LLAMA_TOKENIZER_ROOT}
+```
+
+Validate the local tokenizer directory:
+
+```bash
+python - <<'PY'
+import os
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained(
+    os.environ["LBI_LLAMA_TOKENIZER_ROOT"],
+    use_fast=True,
+    local_files_only=True,
+)
+print("vocab size:", len(tok))
+assert len(tok) == 32000
+PY
+```
 
 ## Export FineWeb-Edu
 

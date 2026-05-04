@@ -1,3 +1,5 @@
+# Adapted from state-spaces/mamba (https://github.com/state-spaces/mamba),
+# licensed under Apache-2.0.
 import torch
 from functools import partial
 from typing import Callable
