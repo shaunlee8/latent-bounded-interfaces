@@ -1,0 +1,25 @@
+name: lbi
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - setuptools
+  - wheel
+  - ninja
+  - cmake
+  - packaging
+  - numpy
+  - matplotlib
+  - pytest
+  - pytorch
+  - pytorch-cuda=12.1
+  - cuda-nvcc=12.1
+  - pip:
+      - datasets
+      - einops
+      - sentencepiece
+      - transformers
+      - triton
