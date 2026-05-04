@@ -54,6 +54,63 @@ Wrapper LR defaults:
 - Transformer: dense/LBI `6e-4`
 - Hybrid: dense `6e-4`, LBI r16 `6e-4`, LBI r32/r64 `3e-4`
 
+## Hyperparameter Selection Details
+
+Dense recipes were selected from short seed-7 sweeps over:
+
+```text
+lr_model
+weight_decay
+warmup_steps
+```
+
+Initial dense grid:
+
+```text
+lr_model: 1e-4, 3e-4, 6e-4
+weight_decay: 0.01, 0.1
+warmup_steps: 500, 1000
+target_steps: 5000
+seed: 7
+```
+
+Follow-up canonical-size refinements were run where needed. The selected dense settings used by `train_dense_paper.sh` are:
+
+| Backbone | `lr_model` | `weight_decay` | `warmup_steps` |
+|---|---:|---:|---:|
+| Mamba-2 | `8e-4` | `0.03` | `1000` |
+| Mamba-3 | `6e-4` | `0.03` | `500` |
+| Transformer | `6e-4` | `0.01` | `1000` |
+| Hybrid | `6e-4` | `0.03` | `500` |
+
+LBI recipes reuse the corresponding dense non-LR optimizer settings and apply targeted LR diagnostics. The selected LBI settings used by `train_lbi_paper.sh` are:
+
+| Backbone / Rank | `lr_model` | `weight_decay` | `warmup_steps` |
+|---|---:|---:|---:|
+| Mamba-2, all ranks | `8e-4` | `0.03` | `1000` |
+| Mamba-3, all ranks | `3e-4` | `0.03` | `500` |
+| Transformer, all ranks | `6e-4` | `0.01` | `1000` |
+| Hybrid, r16 | `6e-4` | `0.03` | `500` |
+| Hybrid, r32/r64 | `3e-4` | `0.03` | `500` |
+
+Held fixed across the canonical runs:
+
+```text
+dataset: FineWeb-Edu
+tokenizer: original 32k LLaMA tokenizer
+seq_len: 1024
+batch_size: 1
+optimizer: AdamW
+lr_schedule: cosine
+min_lr_ratio: 0.1
+grad_clip: 1.0
+tie_embeddings: true
+region_size: 2
+message_hidden_dim: model_dim
+```
+
+Region-size sweeps and Jacobian diagnostics are separate appendix experiments and do not change the selected optimizer recipe.
+
 ## Post-Hoc Evaluation
 
 Use post-hoc eval on `latest.pt` for reported CE:

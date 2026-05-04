@@ -62,7 +62,7 @@ export LBI_DATA_ROOT=/path/to/lbi_data
 export LBI_LLAMA_TOKENIZER_ROOT=${LBI_DATA_ROOT}/tokenizers/llama
 ```
 
-The paper uses the original 32k LLaMA tokenizer. We do not redistribute tokenizer files. Reviewers should request access to the official Meta Llama 2 Hugging Face repository:
+The paper uses the original 32k LLaMA tokenizer. We do not redistribute tokenizer files. Users should request access to the official Meta Llama 2 Hugging Face repository:
 
 https://huggingface.co/meta-llama/Llama-2-7b-hf
 
@@ -189,6 +189,14 @@ The wrapper defaults encode the optimizer settings used for the reported runs:
 - Mamba-3: dense uses `lr=6e-4`; LBI uses `lr=3e-4`
 - Transformer: dense and LBI use `lr=6e-4`
 - Hybrid: dense uses `lr=6e-4`; LBI r16 uses `lr=6e-4`; LBI r32/r64 use `lr=3e-4`
+
+## Hyperparameter Selection
+
+The reported recipes use architecture-specific optimizer settings selected from short seed-7 tuning runs, then fixed for all reported seeds. Dense baselines were tuned over learning rate, weight decay, and warmup. LBI runs reused the corresponding dense non-LR optimizer settings and used targeted LR diagnostics for the interface models.
+
+We did not tune over dataset, tokenizer, sequence length, batch size, LR schedule, minimum LR ratio, gradient clipping, model width/depth, tied embeddings, or interface hidden size for the reported canonical experiments. The region-size sweep and Jacobian diagnostics are separate appendix studies, not part of optimizer selection.
+
+The final recipes are encoded in `scripts/train_dense_paper.sh` and `scripts/train_lbi_paper.sh`. See `scripts/README.md` for the tuning grids and selected values.
 
 ## Post-Hoc CE Evaluation
 
