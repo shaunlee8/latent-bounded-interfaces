@@ -2,7 +2,7 @@
 
 The supported public CUDA code is limited to `cuda/interface/`.
 
-That directory contains the backbone-agnostic suffix-scan extension used to compose bounded-interface pullback matrices during the LBI backward pass. Build it from the repository root with:
+That directory contains the backbone-agnostic suffix-scan extension used to compose bounded-interface pullback matrices during the LBI backward pass. Build it from the repository root after activating the project conda environment:
 
 ```bash
 PYTHON_BIN=${PYTHON_BIN:-python} ./cuda/interface/build.sh

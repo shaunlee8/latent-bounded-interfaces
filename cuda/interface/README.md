@@ -18,11 +18,13 @@ These suffix products propagate message adjoints across regions. Local region ba
 
 ## Build
 
-From the repository root:
+From the repository root, after activating the project conda environment:
 
 ```bash
 PYTHON_BIN=${PYTHON_BIN:-python} ./cuda/interface/build.sh
 ```
+
+Keeping the environment active ensures build tools such as `ninja` are on `PATH`.
 
 The extension module is `interface_scan_cuda`. The Python wrapper is:
 

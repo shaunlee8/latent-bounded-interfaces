@@ -49,13 +49,15 @@ conda activate lbi
 export PYTHON_BIN=python
 ```
 
-Build the interface CUDA extension before running CUDA-backed Mamba/LBI experiments:
+The environment installs `causal-conv1d`, which is required by the Mamba-2 path used in the Mamba-2 and Hybrid experiments. The pip section of `environment.yml` disables build isolation so this package builds against the PyTorch/CUDA stack installed by conda; this source build can take several minutes.
+
+Build the interface CUDA extension from the activated environment before running CUDA-backed Mamba/LBI experiments:
 
 ```bash
 PYTHON_BIN=${PYTHON_BIN} ./cuda/interface/build.sh
 ```
 
-The code expects PyTorch, Triton, einops, transformers, sentencepiece, datasets, numpy, and matplotlib. CUDA is required for Mamba-3 and Hybrid paper-scale runs.
+Keep the conda environment activated while building so tools such as `ninja` are on `PATH`. The code expects PyTorch, Triton, causal-conv1d, einops, transformers, sentencepiece, datasets, huggingface_hub, numpy, and matplotlib. CUDA is required for Mamba-3 and Hybrid paper-scale runs.
 
 ## Data And Tokenizer
 

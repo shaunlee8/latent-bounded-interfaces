@@ -18,6 +18,8 @@ dependencies:
   - pytorch-cuda=12.1
   - cuda-nvcc=12.1
   - pip:
+      - --no-build-isolation
+      - causal-conv1d==1.6.1
       - datasets
       - einops
       - huggingface_hub
