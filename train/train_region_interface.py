@@ -465,7 +465,8 @@ def _resolve_text_paths(cfg: RegionInterfaceConfig) -> tuple[Path, Path | None, 
     if not train_path.exists():
         raise FileNotFoundError(
             f"bundled corpus file missing: {train_path}. "
-            f"Run: python -m data.prepare_corpora --corpora {cfg.text_corpus}"
+            "Prepare the corpus with `python -m data.export_fineweb_edu` or pass explicit "
+            "`--train-text-path`/`--val-text-path` values."
         )
     return train_path, val_path, corpora_root
 

@@ -35,6 +35,10 @@ https://github.com/state-spaces/mamba
 
 The upstream Mamba code is licensed under Apache-2.0. See `THIRD_PARTY_NOTICES.md` and `third_party_licenses/mamba/LICENSE` for attribution and license details.
 
+## License
+
+Unless otherwise noted, this repository's code and documentation are released under the Apache License, Version 2.0; see `LICENSE`. Third-party code adapted from upstream projects remains subject to its original license and attribution notices; see `THIRD_PARTY_NOTICES.md`.
+
 ## Environment
 
 Set the Python executable used by the scripts:
