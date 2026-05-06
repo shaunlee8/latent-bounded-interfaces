@@ -239,8 +239,21 @@ Outputs include:
 
 ## Gradient Parity Report
 
+Generate the paper-table report:
+
+```bash
+${PYTHON_BIN:-python} -m scripts.generate_grad_parity_report \
+  --preset report \
+  --plot \
+  --output-dir out/grad_parity/recompute_report
+```
+
+For a faster functionality check:
+
 ```bash
 ${PYTHON_BIN:-python} -m scripts.generate_grad_parity_report --preset test
 ```
+
+By default, this uses `--interface-jacobian-mode recompute --jacobian-basis-chunk 32`, matching the LBI training launcher and the paper table. Pass `--interface-jacobian-mode graph --jacobian-basis-chunk 1` to run the original autograd-graph reference materialization path instead.
 
 The report cases cover Transformer, Mamba-2, Mamba-3, and Hybrid. Mamba-1 functionality has been removed.

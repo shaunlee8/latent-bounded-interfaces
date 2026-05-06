@@ -336,8 +336,19 @@ ${PYTHON_BIN} -m pytest \
   -q
 ```
 
-The gradient parity report can be generated with:
+The paper gradient parity table can be generated with:
+
+```bash
+${PYTHON_BIN} -m scripts.generate_grad_parity_report \
+  --preset report \
+  --plot \
+  --output-dir out/grad_parity/recompute_report
+```
+
+For a faster functionality check:
 
 ```bash
 ${PYTHON_BIN} -m scripts.generate_grad_parity_report --preset test
 ```
+
+The report defaults to `--interface-jacobian-mode recompute --jacobian-basis-chunk 32`, matching the LBI training launcher and the paper table. The graph-mode reference path remains available via explicit flags.

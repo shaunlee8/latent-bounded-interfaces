@@ -373,13 +373,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--interface-jacobian-mode",
         choices=("graph", "recompute"),
-        default="graph",
-        help="Interface Jacobian materialization path used by native backward.",
+        default="recompute",
+        help=(
+            "Interface Jacobian materialization path used by native backward. "
+            "Defaults to the recompute path used by the paper training launcher; "
+            "pass graph to run the original autograd-graph reference path."
+        ),
     )
     parser.add_argument(
         "--jacobian-basis-chunk",
         type=int,
-        default=1,
+        default=32,
         help="Basis chunk size for recompute-mode interface Jacobian materialization.",
     )
     return parser.parse_args()
