@@ -78,10 +78,13 @@ ${PYTHON_BIN:-python} -m data.export_fineweb_edu \
   --cache-dir ${LBI_DATA_ROOT}/hf_cache \
   --config sample-10BT \
   --train-bytes 1000000000 \
-  --val-bytes 100000000
+  --val-bytes 100000000 \
+  --force-exit-after-export
 ```
 
 This streams `HuggingFaceFW/fineweb-edu` and writes bounded train/validation text files. The raw dataset and Hugging Face cache are not part of the repository.
+
+`--force-exit-after-export` exits immediately after the files are written and flushed. It avoids a known `datasets`/`pyarrow` teardown crash on some hosts where Python aborts after successfully writing the requested byte counts.
 
 ## Pretokenize
 

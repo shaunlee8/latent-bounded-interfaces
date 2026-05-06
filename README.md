@@ -110,8 +110,11 @@ ${PYTHON_BIN} -m data.export_fineweb_edu \
   --cache-dir ${LBI_DATA_ROOT}/hf_cache \
   --config sample-10BT \
   --train-bytes 1000000000 \
-  --val-bytes 100000000
+  --val-bytes 100000000 \
+  --force-exit-after-export
 ```
+
+`--force-exit-after-export` exits immediately after the bounded train/validation text files are flushed. This avoids a known `datasets`/`pyarrow` interpreter-teardown crash observed on some hosts after the export has already completed.
 
 Pretokenize once:
 
