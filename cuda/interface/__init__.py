@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
 try:
@@ -39,3 +37,4 @@ def suffix_scan_pullbacks(mats: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = ["suffix_scan_pullbacks"]
+

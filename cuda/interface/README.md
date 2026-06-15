@@ -1,6 +1,6 @@
 # Interface CUDA Extension
 
-This directory contains the CUDA extension used for scan composition of bounded-interface pullback matrices.
+This directory contains backend-agnostic CUDA kernels for scan composition of bounded-interface pullback matrices.
 
 The LBI backward path materializes per-region interface pullbacks with shape:
 
@@ -8,13 +8,13 @@ The LBI backward path materializes per-region interface pullbacks with shape:
 [batch, num_regions, rank, rank]
 ```
 
-The scan computes suffix products and returns:
+The suffix scan computes products and returns:
 
 ```text
 [batch, num_regions + 1, rank, rank]
 ```
 
-These suffix products propagate message adjoints across regions. Local region backward remains ordinary backbone-specific backward.
+These suffix products propagate message adjoints across regions. Backend-local activation pullbacks live in backend-specific CUDA folders such as `cuda/transformer/`.
 
 ## Build
 
@@ -23,8 +23,6 @@ From the repository root, after activating the project conda environment:
 ```bash
 PYTHON_BIN=${PYTHON_BIN:-python} ./cuda/interface/build.sh
 ```
-
-Keeping the environment active ensures build tools such as `ninja` are on `PATH`.
 
 The extension module is `interface_scan_cuda`. The Python wrapper is:
 
