@@ -100,6 +100,50 @@ def test_suffix_scan_pullbacks_cuda_matches_manual_if_extension_available(shape:
     assert torch.allclose(actual, expected, atol=atol, rtol=rtol)
     assert torch.equal(mats, original)
 
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 0, 1),
+        (1, 1, 1),
+        (1, 2, 16),
+        (2, 4, 32),
+        (2, 8, 64),
+        (1, 16, 128),
+        (1, 8, 256),
+    ],
+)
+def test_suffix_scan_jacobian_cuda_matches_manual_if_extension_available(
+    shape: tuple[int, int, int],
+) -> None:
+    if not _cuda_extension_available():
+        pytest.skip("CUDA extension unavailable")
+
+    import interface_scan_cuda
+
+    assert hasattr(interface_scan_cuda, "suffix_scan_jacobian")
+
+    bsz, n_regions, rank = shape
+    torch.manual_seed(0)
+
+    mats = _random_mats(
+        bsz=bsz,
+        n_regions=n_regions,
+        rank=rank,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    original = mats.clone()
+
+    actual = interface_scan_cuda.suffix_scan_jacobian(mats.contiguous())
+    expected = _manual_suffix(mats).to(dtype=actual.dtype)
+
+    assert actual.shape == expected.shape
+    assert actual.dtype == torch.float32
+
+    atol, rtol = _float32_tolerances(n_regions, rank)
+    assert torch.allclose(actual, expected, atol=atol, rtol=rtol)
+    assert torch.equal(mats, original)
+
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_suffix_scan_pullbacks_cuda_promotes_low_precision_inputs(dtype: torch.dtype) -> None:
