@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from typing import Any, Protocol
 
@@ -149,6 +150,186 @@ def materialize_interface_state_jacobian_t_recompute(
     return state_jacobians_t
 
 
+def materialize_interface_state_jacobian_t_native(
+    *,
+    model: Any,
+    cache: dict[str, Any],
+) -> list[torch.Tensor]:
+    """Build each interface Jacobian `A_k` natively, without differentiating the
+    region forward graph.
+
+    Composes the interface's structured pullbacks with the region backend's
+    native `input_pullback_basis`: transport the identity `I_r` as cotangents on
+    the state output, apply `update^T` (interface), then `J_region^T` (native
+    region pullback), then `decode^T` (interface), and add the skip term. The
+    result matches `materialize_interface_state_jacobian_t_graph`/`_recompute`
+    but the expensive region factor is native.
+
+    The region pullback pushes the full `P=r` identity basis through the
+    region in one pass; splitting `r` into outer chunks repeats the
+    cotangent-independent scan-tile recompute per chunk and is a net loss."""
+    region_caches: Sequence[Any] = cache["region_caches"]
+    if len(region_caches) != model.num_regions:
+        raise ValueError("cache has invalid region_caches length.")
+
+    return [
+        interface_state_jacobian_t_for_region(model=model, region_cache=region_cache)
+        for region_cache in region_caches
+    ]
+
+
+def interface_state_jacobian_t_for_region(*, model: Any, region_cache: Any) -> torch.Tensor:
+    """Native interface Jacobian `A_k^T` for a single region. It is a pure
+    function of that region's cache alone, so Phase 1 can be dispatched per
+    region across streams/GPUs. Transports the identity `I_r` through `update^T`,
+    the native region `input_pullback_basis`, and `decode^T`, plus the skip term."""
+    state_in = region_cache.state_in
+    if state_in.dim() != 2:
+        raise ValueError("interface state inputs must be [B, R].")
+    bsz, rank = state_in.shape
+    # Identity basis on the state output: [B, P=rank, R].
+    eye = torch.eye(rank, device=state_in.device, dtype=state_in.dtype)
+    state_out_basis = eye.unsqueeze(0).expand(bsz, rank, rank)
+
+    update = model.interface.apply_update_jacobian_t_to_region_output(
+        region_cache=region_cache,
+        state_out_cotangent_basis=state_out_basis,
+    )
+    g_region_input = model.region_backend.input_pullback_basis(
+        cache=region_cache.backend_cache,
+        output_cotangent_basis=update["g_region_output"],
+    )
+    decode = model.interface.apply_decode_jacobian_t_to_state_input(
+        region_cache=region_cache,
+        region_input_cotangent_basis=g_region_input,
+    )
+    # [B, P=R_out, R_in] -> [B, R_in, R_out] to match the autograd providers.
+    a_raw = update["g_state_skip"] + decode["g_state_input"]
+    return a_raw.permute(0, 2, 1).contiguous().to(dtype=state_in.dtype)
+
+
+def interface_state_jacobian_for_region_forward(
+    *,
+    model: Any,
+    region_cache: Any,
+    region_output_jvp: Any,
+) -> torch.Tensor:
+    """FORWARD-MODE interface Jacobian for a single region, returned in the same
+    `A_k^T` [B, R_in, R_out] layout as the reverse-mode providers.
+
+    The forward-linearized construction A_k = skip + encode . J_region .
+    decode applied to the identity input basis (the dual of the reverse-mode
+    r VJPs). Transport
+    `I_r` as a state-input tangent basis through `decode` (JVP), then the region
+    forward (`region_output_jvp`, the forward-mode scan/kernel), then `update`
+    (JVP, including the skip). `region_output_jvp` maps a region-input tangent
+    basis [B, P, L, D] -> region-output tangent basis [B, P, L, D].
+
+    The returned tensor matches the reverse providers EXACTLY (same object,
+    opposite mode): update JVP output U[b, p=i, o] = d state_out_o / d state_in_i
+    = (A_k^T)[i, o], no transpose needed."""
+    state_in = region_cache.state_in
+    if state_in.dim() != 2:
+        raise ValueError("interface state inputs must be [B, R].")
+    bsz, rank = state_in.shape
+    # Identity basis on the state INPUT: [B, P=rank, R], column j = e_j.
+    eye = torch.eye(rank, device=state_in.device, dtype=state_in.dtype)
+    state_in_basis = eye.unsqueeze(0).expand(bsz, rank, rank)
+
+    decode = model.interface.apply_decode_jacobian_to_state_input(
+        region_cache=region_cache,
+        state_input_tangent_basis=state_in_basis,
+    )
+    d_region_output = region_output_jvp(decode["d_region_input"])
+    update = model.interface.apply_update_jacobian_to_region_output(
+        region_cache=region_cache,
+        region_output_tangent_basis=d_region_output,
+        state_input_tangent_basis=state_in_basis,
+    )
+    return update["d_state_out"].contiguous().to(dtype=state_in.dtype)
+
+
+class NativeInterfacePullbackProvider:
+    name = "native"
+
+    def __init__(self, *, basis_chunk: int = 1) -> None:
+        self.basis_chunk = int(basis_chunk)
+
+    def materialize_state_jacobian_t(
+        self,
+        *,
+        model: Any,
+        cache: dict[str, Any],
+    ) -> list[torch.Tensor]:
+        del self
+        return materialize_interface_state_jacobian_t_native(model=model, cache=cache)
+
+
+class ForwardModeInterfacePullbackProvider:
+    """Forward-mode interface Jacobians: build each `A_k` as a forward-
+    linearized scan (`decode`-JVP -> region-JVP -> `update`-JVP) instead of r
+    reverse-mode VJPs. The region factor is the backend's `region_output_jvp`;
+    the interface factors are exact JVPs, adjoints of the reverse methods.
+    Same `A_k^T` layout as the other providers."""
+
+    name = "forward_mode"
+
+    def __init__(self, *, basis_chunk: int = 1, use_kernel: "bool | str" = "auto") -> None:
+        self.basis_chunk = int(basis_chunk)
+        self.use_kernel = use_kernel
+
+    def _enable_kernel_path(self, model: Any) -> None:
+        """Request the fused dual-scan kernel path on the backend (best-effort
+        under "auto": falls back to the torch.func reference without tilelang)."""
+        backend = getattr(model, "region_backend", None)
+        if backend is None or self.use_kernel is False:
+            return
+        if getattr(backend, "forward_mode_use_kernel", None):
+            return
+        if self.use_kernel == "auto":
+            try:
+                import tilelang  # noqa: F401
+            except Exception:
+                return
+        backend.forward_mode_use_kernel = True
+
+    def materialize_state_jacobian_t(
+        self,
+        *,
+        model: Any,
+        cache: dict[str, Any],
+    ) -> list[torch.Tensor]:
+        self._enable_kernel_path(model)
+        region_caches: Sequence[Any] = cache["region_caches"]
+        if len(region_caches) != model.num_regions:
+            raise ValueError("cache has invalid region_caches length.")
+        region_output_jvp = getattr(model.region_backend, "region_output_jvp", None)
+        if region_output_jvp is None:
+            raise NotImplementedError(
+                "forward_mode interface provider requires region_backend.region_output_jvp "
+                "(the native forward-mode scan). No autograd fallback."
+            )
+
+        # The region tangent's only consumer is the update-JVP meanpool, so
+        # request the pooled tangent [B, P, 1, D] (LBI_FWDMODE_POOLED=0 escapes).
+        pooled = os.environ.get("LBI_FWDMODE_POOLED", "1") == "1"
+        jacobians: list[torch.Tensor] = []
+        for region_cache in region_caches:
+            def _jvp(region_input_tangent_basis: torch.Tensor, _rc: Any = region_cache) -> torch.Tensor:
+                return region_output_jvp(
+                    cache=_rc.backend_cache,
+                    region_input_tangent_basis=region_input_tangent_basis,
+                    pooled=pooled,
+                )
+
+            jacobians.append(
+                interface_state_jacobian_for_region_forward(
+                    model=model, region_cache=region_cache, region_output_jvp=_jvp,
+                )
+            )
+        return jacobians
+
+
 class TorchGraphInterfacePullbackProvider:
     name = "torch_graph"
 
@@ -194,4 +375,11 @@ def build_interface_pullback_provider(
         return TorchGraphInterfacePullbackProvider(basis_chunk=basis_chunk)
     if normalized in {"recompute", "torch_recompute", "pytorch_recompute"}:
         return TorchRecomputeInterfacePullbackProvider(basis_chunk=basis_chunk)
-    raise ValueError("interface pullback provider must be one of: graph, recompute, torch_graph, torch_recompute")
+    if normalized in {"native", "native_region"}:
+        return NativeInterfacePullbackProvider(basis_chunk=basis_chunk)
+    if normalized in {"forward", "forward_mode", "fwd", "jvp"}:
+        return ForwardModeInterfacePullbackProvider(basis_chunk=basis_chunk)
+    raise ValueError(
+        "interface pullback provider must be one of: graph, recompute, native, "
+        "forward_mode, torch_graph, torch_recompute"
+    )

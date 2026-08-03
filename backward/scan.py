@@ -35,16 +35,16 @@ def lbi_scan_backward_step(
     if num_regions == 0:
         raise RuntimeError("LBI scan backward requires at least one region.")
 
-    local_vjp_provider.store_output_head_grads(model=model, loss=ce_loss, grad_map=grad_map)
+    local_vjp_provider.store_output_head_grads(model=model, loss=ce_loss, grad_map=grad_map, cache=cache)
 
     if num_regions == 1:
         g_state_inputs = [
-            local_vjp_provider.state_adjoint_from_loss(loss=ce_loss, state=states[0])
+            local_vjp_provider.state_adjoint_from_loss(model=model, loss=ce_loss, state=states[0], cache=cache)
         ]
         interface_scan_rms = 0.0
         interface_jacobian_stats = None
     else:
-        g_last_input = local_vjp_provider.state_adjoint_from_loss(loss=ce_loss, state=states[-2])
+        g_last_input = local_vjp_provider.state_adjoint_from_loss(model=model, loss=ce_loss, state=states[-2], cache=cache)
         state_jacobians_t = pullback_provider.materialize_state_jacobian_t(model=model, cache=cache)
         g_last_input = g_last_input.to(device=state_jacobians_t[0].device, dtype=state_jacobians_t[0].dtype)
         interface_jacobian_stats = (
@@ -76,6 +76,7 @@ def lbi_scan_backward_step(
         state0=states[0],
         state0_adjoint=g_state_inputs[0],
         grad_map=grad_map,
+        cache=cache,
     )
 
     for region_index in range(num_regions):
@@ -87,9 +88,10 @@ def lbi_scan_backward_step(
             num_regions=num_regions,
             state_adjoints=g_state_inputs,
             grad_map=grad_map,
+            cache=cache,
         )
 
-    local_vjp_provider.store_shared_canvas_grads(model=model, loss=ce_loss, grad_map=grad_map)
+    local_vjp_provider.store_shared_canvas_grads(model=model, loss=ce_loss, grad_map=grad_map, cache=cache)
     return LBIBackwardResult(
         grad_map=grad_map,
         interface_scan_rms=interface_scan_rms,
@@ -125,12 +127,23 @@ class ScanADEngine:
         *,
         compute_interface_jacobian_stats: bool = False,
     ) -> "ScanADEngine":
-        return cls(
-            pullback_provider=build_interface_pullback_provider(
+        # native_backward selects the autograd-free providers; otherwise the
+        # graph/recompute interface Jacobian with autograd local VJPs.
+        if bool(getattr(cfg, "native_backward", False)):
+            from backward.local_vjp import NativeLocalVJPProvider
+            from backward.pullbacks import NativeInterfacePullbackProvider
+
+            pullback_provider: InterfacePullbackProvider = NativeInterfacePullbackProvider()
+            local_vjp_provider: LocalVJPProvider = NativeLocalVJPProvider()
+        else:
+            pullback_provider = build_interface_pullback_provider(
                 str(cfg.interface_jacobian_mode),
                 basis_chunk=int(cfg.jacobian_basis_chunk),
-            ),
-            local_vjp_provider=TorchAutogradLocalVJPProvider(),
+            )
+            local_vjp_provider = TorchAutogradLocalVJPProvider()
+        return cls(
+            pullback_provider=pullback_provider,
+            local_vjp_provider=local_vjp_provider,
             compute_interface_jacobian_stats=compute_interface_jacobian_stats,
             include_interface_jacobian_suffix=bool(cfg.log_interface_jacobian_suffix),
         )
