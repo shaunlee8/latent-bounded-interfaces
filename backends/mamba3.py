@@ -1001,29 +1001,100 @@ def _rmsnorm_weight_grad(dy: torch.Tensor, x: torch.Tensor, eps: float) -> torch
     return dw.reshape(-1, dw.shape[-1]).sum(0)
 
 
+# Compiled VJP glue stages: the elementwise/norm/projection tails around the
+# opaque scan kernels; LBI_MAMBA_VJP_COMPILE=0 opts out.
+_VJP_COMPILED: dict = {}
+
+
+def _vjp_compiled(fn):
+    import os
+
+    if os.environ.get("LBI_MAMBA_VJP_COMPILE", "1") == "0":
+        return fn
+    c = _VJP_COMPILED.get(fn)
+    if c is None:
+        c = torch.compile(fn, dynamic=False)
+        _VJP_COMPILED[fn] = c
+    return c
+
+
+def _block_norm_vjp(g_u, residual_output, norm_w, eps):
+    """Block-norm pullback: input grad and weight grad in one stage."""
+    x_norm = residual_output.to(norm_w.dtype)
+    return (_rmsnorm_vjp(g_u, x_norm, norm_w, eps),
+            _rmsnorm_weight_grad(g_u, x_norm, eps))
+
+
+def _mixer_vjp_head(ct, y_inner, w_out, nheads, hdim):
+    """out_proj weight grad and the scan-output cotangent in head layout.
+    The weight-grad GEMM runs on bf16 operands (fp32 accumulation)."""
+    g_wout = torch.einsum("bld,ble->de", ct.to(w_out.dtype),
+                          y_inner.to(w_out.dtype)).to(w_out.dtype)
+    g_scan = (ct.to(w_out.dtype) @ w_out).reshape(
+        ct.shape[0], ct.shape[1], nheads, hdim)
+    return g_wout, g_scan.contiguous()
+
+
+def _mixer_vjp_tail(gQ, gK, gZ, gV, gADT, gDT, gTrap, gAng,
+                    in_proj_cached, input_u, dd_A, dd_dt,
+                    w_in, dt_bias, cnorm_w, bnorm_w,
+                    d_inner, d_state, nheads, n_angles, c_eps, b_eps, a_floor):
+    """Pre-projection VJP tail: B/C-norm pullbacks, the dt/A activation
+    chains, and the in_proj reductions."""
+    bsz, seqlen = input_u.shape[0], input_u.shape[1]
+    sizes = [d_inner, d_inner, d_state, d_state, nheads, nheads, nheads, n_angles]
+    _z, _x, b_pre, c_pre, _ddt, _ddA, _trap, _ang = torch.split(in_proj_cached, sizes, dim=-1)
+    ddA_f = dd_A.float()
+    ddt_f = dd_dt.float()
+    softplus_a = torch.nn.functional.softplus(ddA_f)
+    a_clamped = torch.clamp(-softplus_a, max=-a_floor)
+    clamp_mask = (-softplus_a < -a_floor).float()
+    sig_dt = torch.sigmoid(ddt_f + dt_bias.float())
+    sig_a = torch.sigmoid(ddA_f)
+    dt_val = torch.nn.functional.softplus(ddt_f + dt_bias.float())
+
+    dC_post = gQ.reshape(bsz, seqlen, d_state)
+    dB_post = gK.reshape(bsz, seqlen, d_state)
+    g_c_pre = _rmsnorm_vjp(dC_post, c_pre, cnorm_w, c_eps)
+    g_b_pre = _rmsnorm_vjp(dB_post, b_pre, bnorm_w, b_eps)
+    g_cnw = _rmsnorm_weight_grad(dC_post, c_pre, c_eps)
+    g_bnw = _rmsnorm_weight_grad(dB_post, b_pre, b_eps)
+
+    g_z = gZ.reshape(bsz, seqlen, d_inner)
+    g_x = gV.reshape(bsz, seqlen, d_inner)
+    g_adt = gADT.transpose(-1, -2).float()
+    g_dt = gDT.transpose(-1, -2).float()
+    g_ddt = (g_dt + g_adt * a_clamped) * sig_dt
+    g_ddA = (g_adt * dt_val) * clamp_mask * (-sig_a)
+    g_dtb = g_ddt.reshape(-1, nheads).sum(0)
+    g_trap = gTrap.transpose(-1, -2)
+    g_ang = gAng.sum(dim=-2)
+
+    dt = w_in.dtype
+    g_inproj = torch.cat(
+        [g_z.to(dt), g_x.to(dt), g_b_pre.to(dt), g_c_pre.to(dt),
+         g_ddt.to(dt), g_ddA.to(dt), g_trap.to(dt), g_ang.to(dt)],
+        dim=-1,
+    )
+    g_win = torch.einsum("blc,bld->cd", g_inproj, input_u.to(dt))
+    g_u = g_inproj @ w_in
+    return g_u, g_win, g_dtb, g_cnw, g_bnw
+
+
 def mamba3_mixer_param_vjp_native(
     *,
     mixer: nn.Module,
     cache: Mamba3ForwardCache,
     output_cotangent: torch.Tensor,
 ) -> tuple[torch.Tensor, dict]:
-    """Native mixer parameter VJP at `P = 1`.
-
-    Given the real output cotangent `[B, L, D]`, returns `(g_u [B, L, D],
-    {param -> grad})` for the mixer's parameters: the P=1 scan-param grads
-    (`D`, C/B biases) plus the parameter reductions (projection weights, `dt_bias`,
-    B/C-norm weights). Grads are keyed by the parameter object.
-    """
-    bsz, seqlen, _ = output_cotangent.shape
-    heads, hdim = mixer.nheads, mixer.headdim
-    d_inner, d_state, nheads = mixer.d_inner, mixer.d_state, mixer.nheads
+    """Native mixer parameter VJP at `P = 1`: returns `(g_u [B, L, D],
+    {param -> grad})`. The scan pullback runs the SISO backward kernels; the
+    glue on either side runs as two compiled stages."""
     grads: dict = {}
-
-    # out_proj
-    y_inner = cache.y_inner
-    grads[mixer.out_proj.weight] = torch.einsum("bld,ble->de", output_cotangent.float(), y_inner.float()).to(mixer.out_proj.weight.dtype)
-    g_yinner = output_cotangent.to(mixer.out_proj.weight.dtype) @ mixer.out_proj.weight
-    g_scan_out = g_yinner.reshape(bsz, seqlen, heads, hdim).contiguous()
+    g_wout, g_scan_out = _vjp_compiled(_mixer_vjp_head)(
+        output_cotangent, cache.y_inner, mixer.out_proj.weight,
+        mixer.nheads, mixer.headdim)
+    grads[mixer.out_proj.weight] = g_wout
 
     # scan pullback at P=1: scan-input adjoints + scan-param grads
     tiles = _mamba3_recompute_scan_tiles(mixer, cache)
@@ -1032,44 +1103,18 @@ def mamba3_mixer_param_vjp_native(
     grads[mixer.C_bias] = scan_params["dC_bias"].unsqueeze(1).to(mixer.C_bias.dtype)
     grads[mixer.B_bias] = scan_params["dB_bias"].unsqueeze(1).to(mixer.B_bias.dtype)
 
-    # preprocess intermediates
-    sizes = [d_inner, d_inner, d_state, d_state, nheads, nheads, nheads, mixer.num_rope_angles]
-    _z, _x, b_pre, c_pre, _ddt, _ddA, _trap, _ang = torch.split(cache.in_proj, sizes, dim=-1)
-    ddA_f = cache.dd_A.float()
-    ddt_f = cache.dd_dt.float()
-    softplus_a = torch.nn.functional.softplus(ddA_f)
-    a_clamped = torch.clamp(-softplus_a, max=-mixer.A_floor)
-    clamp_mask = (-softplus_a < -mixer.A_floor).float()
-    sig_dt = torch.sigmoid(ddt_f + mixer.dt_bias.float())
-    sig_a = torch.sigmoid(ddA_f)
-    dt_val = torch.nn.functional.softplus(ddt_f + mixer.dt_bias.float())
-
-    # norm VJPs (input grad + weight grad)
-    dC_post = inputs["Q"].reshape(bsz, seqlen, d_state)
-    dB_post = inputs["K"].reshape(bsz, seqlen, d_state)
-    g_c_pre = _rmsnorm_vjp(dC_post, c_pre, mixer.C_norm.weight, mixer.C_norm.eps)
-    g_b_pre = _rmsnorm_vjp(dB_post, b_pre, mixer.B_norm.weight, mixer.B_norm.eps)
-    grads[mixer.C_norm.weight] = _rmsnorm_weight_grad(dC_post, c_pre, mixer.C_norm.eps).to(mixer.C_norm.weight.dtype)
-    grads[mixer.B_norm.weight] = _rmsnorm_weight_grad(dB_post, b_pre, mixer.B_norm.eps).to(mixer.B_norm.weight.dtype)
-
-    g_z = inputs["Z"].reshape(bsz, seqlen, d_inner)
-    g_x = inputs["V"].reshape(bsz, seqlen, d_inner)
-    g_adt = inputs["ADT"].transpose(-1, -2).float()
-    g_dt = inputs["DT"].transpose(-1, -2).float()
-    g_ddt = (g_dt + g_adt * a_clamped) * sig_dt
-    g_ddA = (g_adt * dt_val) * clamp_mask * (-sig_a)
-    grads[mixer.dt_bias] = g_ddt.reshape(-1, nheads).sum(0).to(mixer.dt_bias.dtype)
-    g_trap = inputs["Trap"].transpose(-1, -2)
-    g_ang = inputs["Angles"].sum(dim=-2)
-
-    w_in = mixer.in_proj.weight
-    dt = w_in.dtype
-    g_inproj = torch.cat(
-        [g_z.to(dt), g_x.to(dt), g_b_pre.to(dt), g_c_pre.to(dt), g_ddt.to(dt), g_ddA.to(dt), g_trap.to(dt), g_ang.to(dt)],
-        dim=-1,
-    )
-    grads[w_in] = torch.einsum("blc,bld->cd", g_inproj.float(), cache.input_u.float()).to(dt)
-    g_u = g_inproj @ w_in
+    g_u, g_win, g_dtb, g_cnw, g_bnw = _vjp_compiled(_mixer_vjp_tail)(
+        inputs["Q"], inputs["K"], inputs["Z"], inputs["V"], inputs["ADT"],
+        inputs["DT"], inputs["Trap"], inputs["Angles"],
+        cache.in_proj, cache.input_u, cache.dd_A, cache.dd_dt,
+        mixer.in_proj.weight, mixer.dt_bias, mixer.C_norm.weight,
+        mixer.B_norm.weight, mixer.d_inner, mixer.d_state, mixer.nheads,
+        mixer.num_rope_angles, mixer.C_norm.eps, mixer.B_norm.eps,
+        mixer.A_floor)
+    grads[mixer.dt_bias] = g_dtb.to(mixer.dt_bias.dtype)
+    grads[mixer.C_norm.weight] = g_cnw.to(mixer.C_norm.weight.dtype)
+    grads[mixer.B_norm.weight] = g_bnw.to(mixer.B_norm.weight.dtype)
+    grads[mixer.in_proj.weight] = g_win
     return g_u.to(output_cotangent.dtype), grads
 
 
@@ -1085,9 +1130,10 @@ def mamba3_block_param_vjp_native(
     g_u, grads = mamba3_mixer_param_vjp_native(
         mixer=block.mixer, cache=cache.mixer_cache, output_cotangent=output_cotangent
     )
-    x_norm = cache.residual_output.to(block.norm.weight.dtype)
-    g_res_from_norm = _rmsnorm_vjp(g_u, x_norm, block.norm.weight, block.norm.eps).to(output_cotangent.dtype)
-    grads[block.norm.weight] = _rmsnorm_weight_grad(g_u, x_norm, block.norm.eps).to(block.norm.weight.dtype)
+    g_res_from_norm, g_norm_w = _vjp_compiled(_block_norm_vjp)(
+        g_u, cache.residual_output, block.norm.weight, block.norm.eps)
+    g_res_from_norm = g_res_from_norm.to(output_cotangent.dtype)
+    grads[block.norm.weight] = g_norm_w.to(block.norm.weight.dtype)
 
     if residual_cotangent is None:
         g_residual_total = g_res_from_norm

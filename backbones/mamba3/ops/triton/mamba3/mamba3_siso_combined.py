@@ -17,6 +17,12 @@ from backbones.mamba3.ops.triton.mamba3.mamba3_siso_fwd import mamba3_siso_fwd
 from backbones.mamba3.ops.triton.mamba3.mamba3_siso_bwd import compute_dzdo, compute_dqkv, compute_dqktheta, compute_ddt_dtrap_dinput_states
 from backbones.mamba3.ops.triton.mamba3.angle_dt import angle_dt_fwd, angle_dt_bwd
 
+# forward-cache field reuse (backends/mamba3_forward_mode): when a caller
+# sets this to a dict around a forward call, the SISO Function stashes its
+# materialized intermediates (Q_rot, K_scaled, Scale, Angles_Cumsum) there --
+# the construction path consumes them instead of recomputing the same fields.
+LBI_CAPTURE_SINK: "dict | None" = None
+
 
 def _triton_alloc_fn(size: int, alignment: int, stream: Optional[int]):
     """Allocator for Triton runtime memory (TMA descriptors, scratch)."""
@@ -81,6 +87,17 @@ class _Mamba3Function(torch.autograd.Function):
         
         needs_backward = any(ctx.needs_input_grad)
         has_varlen = cu_seqlens is not None
+        capture = LBI_CAPTURE_SINK
+
+        if needs_backward:
+            # The backward Triton kernels assume packed layouts on the tensors
+            # saved here; the mixer passes transpose (ADT/DT/Trap) and expand
+            # (Angles) views, which silently corrupt dQ/dK/dADT/dDT/dTrap/dAngles
+            # if saved as-is (forward kernels handle the strides correctly).
+            Q, K, V, ADT, DT, Trap = (t.contiguous() for t in (Q, K, V, ADT, DT, Trap))
+            Q_bias, K_bias, Angles = (t.contiguous() for t in (Q_bias, K_bias, Angles))
+            if Z is not None:
+                Z = Z.contiguous()
 
         all_states_present = (Input_SSM_State is not None) and (Input_K_State is not None) and (Input_V_State is not None) and (Input_Angle_State is not None)
         all_states_absent = (Input_SSM_State is None) and (Input_K_State is None) and (Input_V_State is None) and (Input_Angle_State is None)
@@ -104,10 +121,17 @@ class _Mamba3Function(torch.autograd.Function):
         Out, Out_v, SSM_States, DA_CS, DA_CS_SUM, Q_rot, K_scaled, QK_dot, Scale, Gamma, Final_States = mamba3_siso_fwd(
             Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles_Cumsum, D, Z, Input_States,
             chunk_size=chunk_size,
-            store_states_adt_outv=needs_backward,
+            store_states_adt_outv=needs_backward or capture is not None,
             return_final_states=return_final_states,
             cu_seqlens=cu_seqlens,
         )
+        if capture is not None:
+            # forward-cache field reuse: hand the caller the materialized
+            # intermediates the construction path would otherwise recompute
+            # (zero extra compute; the stores above are forced on when
+            # autograd alone would not have made them).
+            capture.update(q_rot=Q_rot, k_scaled=K_scaled, scale_s=Scale,
+                           theta_cs=Angles_Cumsum)
 
         Final_SSM_State = Final_States[0] if Final_States is not None else None
         Final_K_State = Final_States[1] if Final_States is not None else None
@@ -187,6 +211,8 @@ class _Mamba3Function(torch.autograd.Function):
         
         if grad_out is None:
             grad_out = torch.zeros_like(Out)
+        else:
+            grad_out = grad_out.contiguous()  # same packed-layout assumption
         
         # Step 1: Compute dZ and scale grad_out if Z gating is present
         if Z is not None:

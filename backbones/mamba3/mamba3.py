@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from backbones.mamba3.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 from backbones.mamba3.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
+import backbones.mamba3.ops.triton.mamba3.mamba3_siso_combined as _siso_combined_module
 
 
 @dataclass
@@ -32,6 +33,15 @@ class Mamba3ForwardCache:
     C_normed: Tensor
     y_inner: Tensor
     output: Tensor
+    # forward-cache field reuse (optional; populated by forward_with_cache
+    # on the SISO kernel path): the scan kernel's materialized intermediates,
+    # consumed by the forward-mode construction instead of recomputing them.
+    # q_rot [B,L,H,N] = rotated+biased Q; theta_cs [B,L,H,Da] = absolute angle
+    # cumsum; k_scaled [B,L,H,N]; scale_s [B,H,L].
+    q_rot: "Tensor | None" = None
+    theta_cs: "Tensor | None" = None
+    k_scaled: "Tensor | None" = None
+    scale_s: "Tensor | None" = None
 
 
 class Mamba3(nn.Module):
@@ -198,6 +208,7 @@ class Mamba3(nn.Module):
         C = self.C_norm(C)
 
         # Apply Mamba-3 kernel
+        cap = None
         if self.is_mimo:
             angles = angle_dt(angles, DT.transpose(-1, -2)) # (B, L, N, S)
             y = mamba3_mimo_combined(
@@ -235,22 +246,33 @@ class Mamba3(nn.Module):
                 y = torch.einsum("blrhp,hrp->blhp", y, self.mimo_o)
             y = rearrange(y, "b l h p -> b l (h p)")
         else:
-            y = mamba3_siso_combined(
-                Q=C.squeeze(2),
-                K=B.squeeze(2),
-                V=x,
-                ADT=ADT,
-                DT=DT,
-                Trap=trap,
-                Q_bias=self.C_bias.squeeze(1),
-                K_bias=self.B_bias.squeeze(1),
-                Angles=angles,
-                D=self.D,
-                Z=z if not self.is_outproj_norm else None,
-                chunk_size=self.chunk_size,
-                Input_States=None,
-                return_final_states=ssm_state is not None,
-            )
+            # under return_cache, capture the scan kernel's materialized
+            # intermediates for the forward-mode construction (zero extra
+            # compute; see LBI_CAPTURE_SINK in mamba3_siso_combined).
+            if return_cache:
+                cap = {}
+            if cap is not None:
+                _siso_combined_module.LBI_CAPTURE_SINK = cap
+            try:
+                y = mamba3_siso_combined(
+                    Q=C.squeeze(2),
+                    K=B.squeeze(2),
+                    V=x,
+                    ADT=ADT,
+                    DT=DT,
+                    Trap=trap,
+                    Q_bias=self.C_bias.squeeze(1),
+                    K_bias=self.B_bias.squeeze(1),
+                    Angles=angles,
+                    D=self.D,
+                    Z=z if not self.is_outproj_norm else None,
+                    chunk_size=self.chunk_size,
+                    Input_States=None,
+                    return_final_states=ssm_state is not None,
+                )
+            finally:
+                if cap is not None:
+                    _siso_combined_module.LBI_CAPTURE_SINK = None
             if ssm_state is not None:
                 y, last_angle, last_state, last_k, last_v, *rest = y
                 angle_dt_state.copy_(last_angle)
@@ -282,6 +304,10 @@ class Mamba3(nn.Module):
             C_normed=C,
             y_inner=y,
             output=out,
+            q_rot=cap.get("q_rot") if cap else None,
+            theta_cs=cap.get("theta_cs") if cap else None,
+            k_scaled=cap.get("k_scaled") if cap else None,
+            scale_s=cap.get("scale_s") if cap else None,
         )
 
     def forward(self, u, seq_idx=None, cu_seqlens=None, inference_params=None):

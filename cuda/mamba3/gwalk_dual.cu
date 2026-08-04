@@ -45,7 +45,10 @@ constexpr int OFF_X    = OFF_WD  + 64 * 64;
 // Variant region. MEAN: z+dz bf16 [32][64] = 8 KB; FULL: dob fp32 = 8 KB.
 constexpr int OFF_F32  = OFF_X + 4096;
 // floats: L,dL,e,ie,sc,dsc[32] + qk,dqk[32] + dpool[64]
-constexpr size_t SMEM_MIN = (size_t)OFF_F32 * 2 + (8 * GCS + PP) * 4;
+constexpr size_t OFF_STG = (size_t)OFF_F32 * 2 + (8 * GCS + PP) * 4;
+// FULL store staging: OUT/DOUT bf16 [32][72] each (row-padded, conflict-free).
+constexpr int STG_STRIDE = 72;
+constexpr size_t SMEM_MIN = OFF_STG + 2 * GCS * STG_STRIDE * 2;
 
 template <bool MEAN>
 __global__ void __launch_bounds__(128, 1) gwalk_dual_kernel(
@@ -76,6 +79,8 @@ __global__ void __launch_bounds__(128, 1) gwalk_dual_kernel(
     bf16* z_s   = base + OFF_X;                                // MEAN [32][64]
     bf16* dz_s  = z_s + 32 * 64;                               // MEAN [32][64]
     float* dob_s = reinterpret_cast<float*>(base + OFF_X);     // FULL [32][64]
+    bf16* out_st  = reinterpret_cast<bf16*>(smem + OFF_STG);   // FULL [32][72]
+    bf16* dout_st = out_st + GCS * STG_STRIDE;                 // FULL [32][72]
     float* L_s   = reinterpret_cast<float*>(base + OFF_F32);
     float* dL_s  = L_s + GCS;
     float* e_s   = dL_s + GCS;
@@ -416,19 +421,36 @@ __global__ void __launch_bounds__(128, 1) gwalk_dual_kernel(
                 }
             }
             __syncthreads();                               // sync 5
+            // Stage rows in smem so the global stores below are coalesced
+            // uint4 lines; values are bitwise identical to direct stores.
             if (warp < 2) {
 #pragma unroll
-                for (int reg = 0; reg < 32; ++reg) {
+                for (int reg = 0; reg < 32; reg += 2) {
                     int r, q; acc_rc(warp, lane, reg, r, q);
-                    const float o_raw = accH[reg] + e_s[r] * accF[reg];
+                    const float o0 = accH[reg] + e_s[r] * accF[reg];
+                    const float o1 = accH[reg + 1] + e_s[r] * accF[reg + 1];
                     if (lane_i == 0)
-                        OUT[vrow + (long)r * H_ * PP + q] = __float2bfloat16(o_raw);
-                    DOUT[lO + vrow + (long)r * H_ * PP + q] = __float2bfloat16(
-                        dL_s[r] * o_raw + accI[reg] + e_s[r] * accG[reg]
-                        + dob_s[r * 64 + q]);
+                        *reinterpret_cast<__nv_bfloat162*>(out_st + r * STG_STRIDE + q) =
+                            __floats2bfloat162_rn(o0, o1);
+                    *reinterpret_cast<__nv_bfloat162*>(dout_st + r * STG_STRIDE + q) =
+                        __floats2bfloat162_rn(
+                            dL_s[r] * o0 + accI[reg] + e_s[r] * accG[reg]
+                                + dob_s[r * 64 + q],
+                            dL_s[r] * o1 + accI[reg + 1] + e_s[r] * accG[reg + 1]
+                                + dob_s[r * 64 + q + 1]);
                 }
             }
-            __syncthreads();                               // sync 6 (chunk end)
+            __syncthreads();                               // sync 6
+            for (int idx = tid; idx < GCS * 8; idx += 128) {
+                const int i = idx >> 3, u = idx & 7;
+                *reinterpret_cast<uint4*>(DOUT + lO + vrow + (long)i * H_ * PP + u * 8) =
+                    *reinterpret_cast<const uint4*>(dout_st + i * STG_STRIDE + u * 8);
+                if (lane_i == 0)
+                    *reinterpret_cast<uint4*>(OUT + vrow + (long)i * H_ * PP + u * 8) =
+                        *reinterpret_cast<const uint4*>(out_st + i * STG_STRIDE + u * 8);
+            }
+            // No chunk-end barrier: the copy reads only the staging rows, and
+            // their next writers sit behind the next chunk's earlier barriers.
         }
     }
 
