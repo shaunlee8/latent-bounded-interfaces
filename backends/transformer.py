@@ -29,6 +29,15 @@ class TransformerAttentionCache:
     attn_output: torch.Tensor
     out_proj_input: torch.Tensor
     out_proj_output: torch.Tensor
+    # Pre-conv projection, the operating point of the forward-mode tangent
+    # synthesis (qkv above is post-conv when d_conv > 0).
+    qkv_preconv: torch.Tensor | None = None
+    # Flash softmax stats consumed by the native backward's direct call to
+    # the flash backward op.
+    attn_out_bhld: torch.Tensor | None = None
+    attn_logsumexp: torch.Tensor | None = None
+    attn_philox_seed: torch.Tensor | None = None
+    attn_philox_offset: torch.Tensor | None = None
 
 
 @dataclass
@@ -85,6 +94,69 @@ class TransformerLowering(Protocol):
         ...
 
 
+def softmax_scale(attn):
+    """The attention module's softmax scale (1/sqrt(hd) unless overridden)."""
+    return attn.softmax_scale if attn.softmax_scale is not None else 1.0 / math.sqrt(attn.head_dim)
+
+
+def _attention_stage(x, in_w, conv_w, out_w, n_heads, n_kv_heads, head_dim,
+                     d_conv, rope_base, interleaved, scale):
+    """The attention cache tensors as one pure function of (input, weights);
+    weights ride as arguments so a single compiled graph serves every layer."""
+    bsz, seqlen, _ = x.shape
+    qkv_pre = F.linear(x, in_w)
+    if d_conv > 0:
+        qkv = F.conv1d(qkv_pre.transpose(1, 2), conv_w, None, padding=d_conv - 1,
+                       groups=conv_w.shape[0])[..., :seqlen].transpose(1, 2).contiguous()
+    else:
+        qkv = qkv_pre
+    q_dim = n_heads * head_dim
+    kv_dim = n_kv_heads * head_dim
+    q_raw, k_raw, v_raw = qkv.split((q_dim, kv_dim, kv_dim), dim=-1)
+    q = q_raw.view(bsz, seqlen, n_heads, head_dim).transpose(1, 2)
+    k = k_raw.view(bsz, seqlen, n_kv_heads, head_dim).transpose(1, 2)
+    v = v_raw.view(bsz, seqlen, n_kv_heads, head_dim).transpose(1, 2)
+    q_rope = apply_rope(q, base=rope_base, interleaved=interleaved)
+    k_rope = apply_rope(k, base=rope_base, interleaved=interleaved)
+    rep = n_heads // n_kv_heads
+    k_exp = k_rope if rep == 1 else k_rope.repeat_interleave(rep, dim=1)
+    v_exp = v if rep == 1 else v.repeat_interleave(rep, dim=1)
+    out_bhld, lse, seed, offset = _flash_with_stats(q_rope, k_exp, v_exp, scale)
+    heads = out_bhld.transpose(1, 2)
+    opi = heads.contiguous().view(bsz, seqlen, q_dim)
+    opo = F.linear(opi, out_w)
+    return (qkv_pre, qkv, q, k, v, q_rope, k_rope, k_exp, v_exp, heads,
+            opi, opo, out_bhld, lse, seed, offset)
+
+
+def _flash_with_stats(q, k, v, scale):
+    """Flash attention returning (out, logsumexp, philox seed/offset);
+    [B,H,L,hd] in and out. The stats feed the flash backward op directly."""
+    out = torch.ops.aten._scaled_dot_product_flash_attention(
+        q, k, v, 0.0, True, False, scale=scale)
+    return out[0], out[1], out[6], out[7]
+
+
+def _mlp_stage(x, fc1_w, fc2_w):
+    fc1_out = F.linear(x, fc1_w)
+    up, gate = fc1_out.chunk(2, dim=-1)
+    act = F.silu(gate)
+    di = up * act
+    do = F.linear(di, fc2_w)
+    return fc1_out, up, gate, act, di, do
+
+
+_COMPILED_STAGES: dict = {}
+
+
+def _compiled(fn):
+    c = _COMPILED_STAGES.get(fn)
+    if c is None:
+        c = torch.compile(fn, dynamic=False)
+        _COMPILED_STAGES[fn] = c
+    return c
+
+
 class TransformerRegionBackend(nn.Module):
     """Executes Transformer layer ranges and records per-layer region caches."""
 
@@ -116,74 +188,78 @@ class TransformerRegionBackend(nn.Module):
             raise IndexError(f"region_index {region_index} out of range for {len(self.region_ranges)} regions") from exc
 
     def _attention_forward_with_cache(self, attn: nn.Module, norm_output: torch.Tensor) -> tuple[torch.Tensor, TransformerAttentionCache]:
-        bsz, seqlen, _ = norm_output.shape
-        qkv = attn.in_proj(norm_output)
-        if attn.d_conv > 0:
-            qkv = attn.conv1d(qkv.transpose(1, 2))[..., :seqlen].transpose(1, 2).contiguous()
-        q_dim = attn.n_heads * attn.head_dim
-        kv_dim = attn.n_kv_heads * attn.head_dim
-        q_raw, k_raw, v_raw = qkv.split((q_dim, kv_dim, kv_dim), dim=-1)
-        q = q_raw.view(bsz, seqlen, attn.n_heads, attn.head_dim).transpose(1, 2)
-        k = k_raw.view(bsz, seqlen, attn.n_kv_heads, attn.head_dim).transpose(1, 2)
-        v = v_raw.view(bsz, seqlen, attn.n_kv_heads, attn.head_dim).transpose(1, 2)
-        q_rope = apply_rope(q, base=attn.rope_base, interleaved=attn.rope_interleaved)
-        k_rope = apply_rope(k, base=attn.rope_base, interleaved=attn.rope_interleaved)
-        k_expanded = attn._expand_kv(k_rope)
-        v_expanded = attn._expand_kv(v)
+        if (getattr(self, "compile_forward_stages", False)
+                and attn.in_proj.bias is None and attn.out_proj.bias is None
+                and (attn.d_conv <= 0 or attn.conv1d.bias is None)):
+            conv_w = attn.conv1d.weight if attn.d_conv > 0 else attn.in_proj.weight
+            (qkv_preconv, qkv, q, k, v, q_rope, k_rope, k_expanded, v_expanded,
+             attn_heads, out_proj_input, out_proj_output, out_bhld, lse, seed,
+             offset) = _compiled(_attention_stage)(
+                norm_output, attn.in_proj.weight, conv_w, attn.out_proj.weight,
+                attn.n_heads, attn.n_kv_heads, attn.head_dim, attn.d_conv,
+                attn.rope_base, attn.rope_interleaved, softmax_scale(attn))
+        else:
+            bsz, seqlen, _ = norm_output.shape
+            qkv = attn.in_proj(norm_output)
+            qkv_preconv = qkv
+            if attn.d_conv > 0:
+                qkv = attn.conv1d(qkv.transpose(1, 2))[..., :seqlen].transpose(1, 2).contiguous()
+            q_dim = attn.n_heads * attn.head_dim
+            kv_dim = attn.n_kv_heads * attn.head_dim
+            q_raw, k_raw, v_raw = qkv.split((q_dim, kv_dim, kv_dim), dim=-1)
+            q = q_raw.view(bsz, seqlen, attn.n_heads, attn.head_dim).transpose(1, 2)
+            k = k_raw.view(bsz, seqlen, attn.n_kv_heads, attn.head_dim).transpose(1, 2)
+            v = v_raw.view(bsz, seqlen, attn.n_kv_heads, attn.head_dim).transpose(1, 2)
+            q_rope = apply_rope(q, base=attn.rope_base, interleaved=attn.rope_interleaved)
+            k_rope = apply_rope(k, base=attn.rope_base, interleaved=attn.rope_interleaved)
+            k_expanded = attn._expand_kv(k_rope)
+            v_expanded = attn._expand_kv(v)
 
-        used_flash = False
-        if attn._can_use_flash_attn(norm_output):
-            try:
-                attn_heads = attn._flash_attention(q_rope, k_expanded, v_expanded)
-                used_flash = True
-            except RuntimeError:
-                attn._flash_attn_disabled = True
-        if not used_flash:
-            scale = attn.softmax_scale if attn.softmax_scale is not None else 1.0 / math.sqrt(attn.head_dim)
-            attn_heads = F.scaled_dot_product_attention(
-                q_rope,
-                k_expanded,
-                v_expanded,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=True,
-                scale=scale,
-            ).transpose(1, 2)
-        out_proj_input = attn_heads.contiguous().view(bsz, seqlen, attn.out_dim)
-        out_proj_output = attn.out_proj(out_proj_input)
+            used_flash = False
+            out_bhld = lse = seed = offset = None
+            if attn._can_use_flash_attn(norm_output):
+                try:
+                    attn_heads = attn._flash_attention(q_rope, k_expanded, v_expanded)
+                    used_flash = True
+                except RuntimeError:
+                    attn._flash_attn_disabled = True
+            if not used_flash:
+                try:
+                    out_bhld, lse, seed, offset = _flash_with_stats(
+                        q_rope, k_expanded, v_expanded, softmax_scale(attn))
+                    attn_heads = out_bhld.transpose(1, 2)
+                except RuntimeError:
+                    attn_heads = F.scaled_dot_product_attention(
+                        q_rope, k_expanded, v_expanded, attn_mask=None,
+                        dropout_p=0.0, is_causal=True, scale=softmax_scale(attn),
+                    ).transpose(1, 2)
+            out_proj_input = attn_heads.contiguous().view(bsz, seqlen, attn.out_dim)
+            out_proj_output = attn.out_proj(out_proj_input)
         cache = TransformerAttentionCache(
-            norm_input=norm_output,
-            norm_output=norm_output,
-            qkv=qkv,
-            q=q,
-            k=k,
-            v=v,
-            q_rope=q_rope,
-            k_rope=k_rope,
-            k_expanded=k_expanded,
-            v_expanded=v_expanded,
-            attn_output=attn_heads,
-            out_proj_input=out_proj_input,
-            out_proj_output=out_proj_output,
-        )
+            norm_input=norm_output, norm_output=norm_output, qkv=qkv,
+            qkv_preconv=qkv_preconv, q=q, k=k, v=v, q_rope=q_rope,
+            k_rope=k_rope, k_expanded=k_expanded, v_expanded=v_expanded,
+            attn_output=attn_heads, out_proj_input=out_proj_input,
+            out_proj_output=out_proj_output, attn_out_bhld=out_bhld,
+            attn_logsumexp=lse, attn_philox_seed=seed,
+            attn_philox_offset=offset)
         return out_proj_output, cache
 
     def _mlp_forward_with_cache(self, mlp: nn.Module, norm_output: torch.Tensor) -> tuple[torch.Tensor, TransformerMLPCache]:
-        fc1_output = mlp.fc1(norm_output)
-        up, gate = fc1_output.chunk(2, dim=-1)
-        activation = F.silu(gate)
-        down_input = up * activation
-        down_output = mlp.fc2(down_input)
+        if (getattr(self, "compile_forward_stages", False)
+                and mlp.fc1.bias is None and mlp.fc2.bias is None):
+            fc1_output, up, gate, activation, down_input, down_output = \
+                _compiled(_mlp_stage)(norm_output, mlp.fc1.weight, mlp.fc2.weight)
+        else:
+            fc1_output = mlp.fc1(norm_output)
+            up, gate = fc1_output.chunk(2, dim=-1)
+            activation = F.silu(gate)
+            down_input = up * activation
+            down_output = mlp.fc2(down_input)
         cache = TransformerMLPCache(
-            norm_input=norm_output,
-            norm_output=norm_output,
-            fc1_output=fc1_output,
-            up=up,
-            gate=gate,
-            activation=activation,
-            down_input=down_input,
-            down_output=down_output,
-        )
+            norm_input=norm_output, norm_output=norm_output,
+            fc1_output=fc1_output, up=up, gate=gate, activation=activation,
+            down_input=down_input, down_output=down_output)
         return down_output, cache
 
     def _block_forward_with_cache(
@@ -278,6 +354,73 @@ class TransformerRegionBackend(nn.Module):
             cache=cache,
             output_cotangent=output_cotangent,
         )
+
+    def parameter_vjp_with_input_cotangent(
+        self,
+        *,
+        cache: TransformerRegionCache,
+        output_cotangent: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Parameter grads and the region-input cotangent from one reverse
+        walk over the cached activations, without replaying the region
+        forward. Falls back to the autograd lowering outside the native
+        contract or when LBI_TRANSFORMER_NATIVE_VJP=0."""
+        import os
+
+        from backends.transformer_native_vjp import (
+            native_vjp_supported, transformer_region_parameter_vjp)
+
+        if (os.environ.get("LBI_TRANSFORMER_NATIVE_VJP", "1") != "0"
+                and native_vjp_supported(self, cache)):
+            return transformer_region_parameter_vjp(self, cache, output_cotangent)
+        grads = self.lowering.parameter_vjp(
+            backend=self, cache=cache, output_cotangent=output_cotangent)
+        g_in = self.lowering.input_pullback_basis(
+            backend=self, cache=cache,
+            output_cotangent_basis=output_cotangent.unsqueeze(1)).squeeze(1)
+        return grads, g_in
+
+    def region_output_jvp(
+        self,
+        *,
+        cache: TransformerRegionCache,
+        region_input_tangent_basis: torch.Tensor,
+        compute_dtype: torch.dtype | None = None,
+        pooled: bool = False,
+    ) -> torch.Tensor:
+        """Push a region-input tangent basis [B, P, L, D] to the region-output
+        tangent basis at the frozen operating point (the dual of
+        `input_pullback_basis`). `forward_mode_use_kernel` selects the fused
+        kernels over the torch.func reference; `pooled` returns the mean over
+        L with keepdim; `compute_dtype=None` resolves to bf16 on the kernel
+        path (LBI_FWDMODE_CD=float32 escapes) and fp32 on the reference."""
+        if getattr(self, "forward_mode_use_kernel", False):
+            from backends.transformer_forward_mode import (
+                transformer_region_output_jvp_kernel,
+            )
+
+            if compute_dtype is None:
+                import os
+
+                compute_dtype = (torch.float32
+                                 if os.environ.get("LBI_FWDMODE_CD") == "float32"
+                                 else torch.bfloat16)
+            return transformer_region_output_jvp_kernel(
+                self,
+                cache=cache,
+                region_input_tangent_basis=region_input_tangent_basis,
+                compute_dtype=compute_dtype,
+                pooled=pooled,
+            )
+        from backends.transformer_forward_mode import transformer_region_output_jvp
+
+        out = transformer_region_output_jvp(
+            self,
+            cache=cache,
+            region_input_tangent_basis=region_input_tangent_basis,
+            compute_dtype=compute_dtype if compute_dtype is not None else torch.float32,
+        )
+        return out.mean(dim=2, keepdim=True) if pooled else out
 
 
 class TorchAutogradTransformerLowering:

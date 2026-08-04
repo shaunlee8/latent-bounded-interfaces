@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -7,7 +8,12 @@ import torch
 import torch.nn as nn
 
 from backbones.general import BackboneSpec, _make_final_norm, init_transformer_module
-from backends import BackboneStackRegionBackend, RegionForwardCache, TransformerRegionBackend
+from backends import (
+    BackboneStackRegionBackend,
+    Mamba3RegionBackend,
+    RegionForwardCache,
+    TransformerRegionBackend,
+)
 from canvas import TokenEmbeddingCanvas
 from interfaces import InterfaceModule, InterfaceStep
 from readouts import NormLMHeadReadout
@@ -84,6 +90,8 @@ class LBILanguageModel(nn.Module):
         self.canvas = TokenEmbeddingCanvas(vocab_size=vocab_size, feature_dim=self.hidden_dim)
         if backbone_spec.name == "transformer":
             self.region_backend = TransformerRegionBackend(backbone_spec=backbone_spec, region_ranges=self.region_ranges)
+        elif backbone_spec.name == "mamba3":
+            self.region_backend = Mamba3RegionBackend(backbone_spec=backbone_spec, region_ranges=self.region_ranges)
         else:
             self.region_backend = BackboneStackRegionBackend(backbone_spec=backbone_spec, region_ranges=self.region_ranges)
         self.readout = NormLMHeadReadout(
@@ -152,7 +160,23 @@ class LBILanguageModel(nn.Module):
         message_noise_std: float = 1.0,
         message_mask_keep_prob: float = 0.5,
         ablation_generator: torch.Generator | None = None,
+        native_backward: bool = False,
+        trim_region_cache: bool = False,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        # native_backward runs the region body under no_grad (the native scan
+        # backward rebuilds region grads from the frozen backend caches);
+        # canvas / initialize / readout stay under grad. trim_region_cache
+        # additionally keeps only each region input and recomputes region
+        # forwards on demand.
+        region_ctx = torch.no_grad() if native_backward else contextlib.nullcontext()
+        if trim_region_cache and not native_backward:
+            raise ValueError("trim_region_cache requires native_backward=True")
+        prev_recompute = getattr(self.region_backend, "recompute_forward", None)
+        if trim_region_cache:
+            if prev_recompute is None:
+                raise ValueError("region backend does not support trim_region_cache")
+            self.region_backend.recompute_forward = True
+
         canvas_features = self.canvas(input_ids)
         state = self.interface.initialize(canvas_features)
         state = self._apply_state_ablation(
@@ -169,20 +193,21 @@ class LBILanguageModel(nn.Module):
 
         for region_index, (start, end) in enumerate(self.region_ranges):
             state_in = state
-            condition = self.interface.decode(state_in, region_index)
-            region_input = canvas_features + condition.unsqueeze(1)
-            region_output, backend_cache = self.region_backend.forward_region(
-                region_input=region_input,
-                region_index=region_index,
-            )
-            interface_step = self.interface.update(state_in, region_output, region_index)
-            state = self._apply_state_ablation(
-                interface_step.state,
-                mode=message_ablation,
-                noise_std=message_noise_std,
-                mask_keep_prob=message_mask_keep_prob,
-                generator=ablation_generator,
-            )
+            with region_ctx:
+                condition = self.interface.decode(state_in, region_index)
+                region_input = canvas_features + condition.unsqueeze(1)
+                region_output, backend_cache = self.region_backend.forward_region(
+                    region_input=region_input,
+                    region_index=region_index,
+                )
+                interface_step = self.interface.update(state_in, region_output, region_index)
+                state = self._apply_state_ablation(
+                    interface_step.state,
+                    mode=message_ablation,
+                    noise_std=message_noise_std,
+                    mask_keep_prob=message_mask_keep_prob,
+                    generator=ablation_generator,
+                )
             states.append(state)
             region_inputs.append(region_input)
             region_outputs.append(region_output)
@@ -201,7 +226,17 @@ class LBILanguageModel(nn.Module):
                 )
             )
 
-        logits = self.readout(region_outputs[-1], canvas=self.canvas)
+        if trim_region_cache:
+            self.region_backend.recompute_forward = prev_recompute
+
+        # The readout needs a grad-connected input: under native_backward the last
+        # region output is detached, so re-expose it as a grad leaf (and record it
+        # on its cache so the seed's dL/d(region_output) autograd can reach it).
+        readout_input = region_outputs[-1]
+        if native_backward:
+            readout_input = readout_input.detach().requires_grad_(True)
+            region_caches[-1].region_output = readout_input
+        logits = self.readout(readout_input, canvas=self.canvas)
         cache = LBICache(
             canvas_features=canvas_features,
             states=states,
