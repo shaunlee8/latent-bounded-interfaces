@@ -1,6 +1,8 @@
 # Paper Scripts
 
-Use these wrappers for paper reproduction instead of calling `train/train_region_interface.py` directly. The lower-level training script exposes additional research/debug flags; the wrappers encode the canonical paper recipes.
+Use these wrappers for paper reproduction instead of calling `train/lbi.py` directly. The lower-level training script exposes additional research/debug flags; the wrappers encode the canonical paper recipes. Both launchers source `paper_train_common.sh` (one shared body, `VARIANT=dense|lbi`); every knob is an environment override.
+
+Engine knobs (LBI runs): `LBI_BACKWARD=scan|autograd` selects the region-decomposed scan engine or plain end-to-end backprop; `NATIVE_BACKWARD=true` + `INTERFACE_JACOBIAN_MODE=forward` selects the autograd-free engine with the forward-mode kernel A_k; `COMPILE_TURN=true` compiles the region forward stages. Dense runs accept `COMPILE_DENSE=true`.
 
 ## Training
 

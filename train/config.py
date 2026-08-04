@@ -165,8 +165,30 @@ class LBITrainingConfig:
     message_dim: int = 64
     message_hidden_dim: int = 0
     message_scale_init: float = 0.5
+    # A_k lowering: "forward" = the forward-mode construction (kernel path),
+    # "native" = the reverse-mode native pullback, "graph"/"recompute" = the
+    # autograd reverse constructions (oracles / fallback).
     interface_jacobian_mode: str = "graph"
     jacobian_basis_chunk: int = 1
+    # LBI backward engine: "scan" = the region-decomposed scan engine (the
+    # parallelizable path; pays the per-step A_k construction), "autograd" =
+    # plain end-to-end backprop through the region graph (the cheapest exact
+    # single-device engine; no A_k, no interface-Jacobian diagnostics).
+    lbi_backward: str = "scan"
+    # Compiled turn stages for the region forward (weights-as-arguments
+    # graphs); pays a first-step compile, wins on long runs.
+    compile_turn: bool = False
+    # Native-backward training keeps fp32 master weights in the optimizer
+    # (the model runs bf16); matches the dense arm's precision regime.
+    fp32_master: bool = True
+    # torch.compile the dense baseline model.
+    compile_dense: bool = False
+    # Autograd-free native backward: native interface pullback + native local VJP
+    # over a forward that builds no region autograd graph (native_backward). With
+    # trim_region_cache, per-layer forward caches are dropped and recomputed on
+    # demand (store-vs-recompute; requires backend support, e.g. mamba3).
+    native_backward: bool = False
+    trim_region_cache: bool = False
     log_interface_jacobian_every: int = 0
     log_interface_jacobian_suffix: bool = False
     eval_message_ablation: str = "none"
@@ -265,6 +287,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--message-scale-init", type=float, default=0.5)
     p.add_argument("--interface-jacobian-mode", type=str, default="graph")
     p.add_argument("--jacobian-basis-chunk", type=int, default=1)
+    p.add_argument("--native-backward", action="store_true")
+    p.add_argument("--trim-region-cache", action="store_true")
+    p.add_argument("--lbi-backward", type=str, default="scan", choices=["scan", "autograd"])
+    p.add_argument("--compile-turn", action="store_true")
+    p.add_argument("--no-fp32-master", action="store_true")
+    p.add_argument("--compile-dense", action="store_true")
     p.add_argument("--log-interface-jacobian-every", type=int, default=0)
     p.add_argument("--log-interface-jacobian-suffix", action="store_true")
     p.add_argument("--eval-message-ablation", type=str, default="none")
@@ -339,10 +367,12 @@ def validate_config(cfg: LBITrainingConfig) -> None:
         raise ValueError("message_hidden_dim must be >= 0.")
     if cfg.message_scale_init <= 0.0:
         raise ValueError("message_scale_init must be > 0.")
-    if cfg.interface_jacobian_mode not in {"graph", "recompute"}:
-        raise ValueError("interface_jacobian_mode must be one of: graph, recompute")
+    if cfg.interface_jacobian_mode not in {"graph", "recompute", "forward"}:
+        raise ValueError("interface_jacobian_mode must be one of: graph, recompute, forward")
     if cfg.jacobian_basis_chunk <= 0:
         raise ValueError("jacobian_basis_chunk must be > 0.")
+    if cfg.trim_region_cache and not cfg.native_backward:
+        raise ValueError("trim_region_cache requires native_backward=True")
     if cfg.log_interface_jacobian_every < 0:
         raise ValueError("log_interface_jacobian_every must be >= 0.")
     if cfg.eval_message_ablation not in {"none", *EVAL_MESSAGE_ABLATION_MODES}:
@@ -437,6 +467,12 @@ def config_from_args(args: argparse.Namespace) -> LBITrainingConfig:
         message_scale_init=args.message_scale_init,
         interface_jacobian_mode=args.interface_jacobian_mode,
         jacobian_basis_chunk=args.jacobian_basis_chunk,
+        native_backward=args.native_backward,
+        trim_region_cache=args.trim_region_cache,
+        lbi_backward=args.lbi_backward,
+        compile_turn=args.compile_turn,
+        fp32_master=not args.no_fp32_master,
+        compile_dense=args.compile_dense,
         log_interface_jacobian_every=args.log_interface_jacobian_every,
         log_interface_jacobian_suffix=args.log_interface_jacobian_suffix,
         eval_message_ablation=args.eval_message_ablation,

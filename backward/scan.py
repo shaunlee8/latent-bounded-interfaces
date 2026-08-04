@@ -127,13 +127,22 @@ class ScanADEngine:
         *,
         compute_interface_jacobian_stats: bool = False,
     ) -> "ScanADEngine":
-        # native_backward selects the autograd-free providers; otherwise the
-        # graph/recompute interface Jacobian with autograd local VJPs.
+        # native_backward selects the autograd-free providers (with the A_k
+        # construction chosen by interface_jacobian_mode: forward-mode kernel
+        # path or reverse-mode native pullback); otherwise the graph/recompute
+        # interface Jacobian with autograd local VJPs.
         if bool(getattr(cfg, "native_backward", False)):
             from backward.local_vjp import NativeLocalVJPProvider
-            from backward.pullbacks import NativeInterfacePullbackProvider
+            from backward.pullbacks import (
+                ForwardModeInterfacePullbackProvider,
+                NativeInterfacePullbackProvider,
+            )
 
-            pullback_provider: InterfacePullbackProvider = NativeInterfacePullbackProvider()
+            mode = str(getattr(cfg, "interface_jacobian_mode", "native")).lower()
+            if mode in {"forward", "forward_mode", "fwd", "jvp"}:
+                pullback_provider: InterfacePullbackProvider = ForwardModeInterfacePullbackProvider()
+            else:
+                pullback_provider = NativeInterfacePullbackProvider()
             local_vjp_provider: LocalVJPProvider = NativeLocalVJPProvider()
         else:
             pullback_provider = build_interface_pullback_provider(

@@ -9,8 +9,9 @@ import pytest
 import torch
 
 from backbones.general import BackboneSpec
-from models.native_region_interface import NativeRegionInterfaceModel
-from train.train_region_interface import _autograd_backward_step, _native_backward_step, _next_token_loss
+from legacy.native_region_interface import NativeRegionInterfaceModel
+from legacy.backward import _native_backward_step
+from train.lbi import _autograd_backward_step, _next_token_loss
 
 
 _DTYPE_BY_NAME = {

@@ -39,3 +39,12 @@ core.*
 .venv/
 venv/
 .DS_Store
+
+# Relocated LBI-1 CUDA sources kept on disk for reference only
+cuda/legacy/
+
+# Local research notes (never committed)
+README_plan.md
+README_log.md
+README_research.md
+cuda/transformer/README_plan.md

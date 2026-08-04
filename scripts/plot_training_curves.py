@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+from train.config import DENSE_VARIANT, LBI_VARIANT, normalize_model_variant
 from matplotlib.lines import Line2D
 from matplotlib.ticker import MaxNLocator
 
@@ -88,7 +90,7 @@ def _parse_args() -> argparse.Namespace:
         "--regimes",
         type=str,
         default="",
-        help="Optional comma-separated regime filter, e.g. native_region_interface.",
+        help="Optional comma-separated variant/regime filter, e.g. lbi or native_region_interface.",
     )
     p.add_argument(
         "--smooth-window",
@@ -170,7 +172,7 @@ def _variant_from_run_dir(experiment_root: Path, run_dir: Path, config: Dict[str
     variant = parts[0] if len(parts) > 1 else run_dir.parent.name
     if variant and variant != "." and variant != run_dir.name:
         return variant
-    if regime == "backprop_ref":
+    if normalize_model_variant(regime) == DENSE_VARIANT:
         return f"dense_seed{config.get('seed', 'unknown')}"
     msg = config.get("message_dim", "unknown")
     return f"lbi_r{msg}_seed{config.get('seed', 'unknown')}"
@@ -190,16 +192,16 @@ def _load_run_artifacts(
         config = _load_json(run_dir / "config.json")
         model_info = _load_json(run_dir / "model_info.json")
         summary = _load_json(run_dir / "summary.json")
-        regime = str(summary.get("regime", run_dir.name))
-        if regimes is not None and regime not in regimes:
+        regime = str(summary.get("variant", summary.get("regime", run_dir.name)))
+        if regimes is not None and normalize_model_variant(regime) not in regimes:
             continue
         variant = _variant_from_run_dir(experiment_root, run_dir, config, regime)
         if include_re is not None and include_re.search(variant) is None:
             continue
         if exclude_re is not None and exclude_re.search(variant) is not None:
             continue
-        message_dim = int(config["message_dim"]) if regime == "native_region_interface" and "message_dim" in config else None
-        region_size = int(config["region_size"]) if regime == "native_region_interface" and "region_size" in config else None
+        message_dim = int(config["message_dim"]) if normalize_model_variant(regime) == LBI_VARIANT and "message_dim" in config else None
+        region_size = int(config["region_size"]) if normalize_model_variant(regime) == LBI_VARIANT and "region_size" in config else None
         lr_model = float(config["lr_model"]) if "lr_model" in config else None
         runs.append(
             RunArtifact(
@@ -238,13 +240,13 @@ def _label_for_run(
     if label_mode == "backbone_regime":
         return f"{run.backbone}:{run.regime}"
     if label_mode == "region_size":
-        if run.regime == "backprop_ref":
+        if normalize_model_variant(run.regime) == DENSE_VARIANT:
             return "dense"
         if run.region_size is not None:
             return f"region={run.region_size}"
         return run.variant
     if label_mode == "rank_region":
-        if run.regime == "backprop_ref":
+        if normalize_model_variant(run.regime) == DENSE_VARIANT:
             return "dense"
         rank = f"r={run.message_dim}" if run.message_dim is not None else "r=?"
         if len(lbi_region_sizes) <= 1:
@@ -252,12 +254,12 @@ def _label_for_run(
         region = f"region={run.region_size}" if run.region_size is not None else "region=?"
         return f"LBI {rank}, {region}"
     if label_mode == "variant":
-        if run.regime == "backprop_ref":
+        if normalize_model_variant(run.regime) == DENSE_VARIANT:
             return "dense"
         return f"LBI r={run.message_dim}"
-    if run.regime == "backprop_ref":
+    if normalize_model_variant(run.regime) == DENSE_VARIANT:
         return "dense"
-    if run.regime == "native_region_interface" and run.message_dim is not None:
+    if normalize_model_variant(run.regime) == LBI_VARIANT and run.message_dim is not None:
         return f"LBI r={run.message_dim}"
     if len(backbones) > 1 and len(regimes) > 1:
         return f"{run.backbone}:{run.regime}"
@@ -682,7 +684,7 @@ def generate_training_plots(
     exclude_variant_regex: str = "",
 ) -> Path:
     _set_paper_style(font_scale=font_scale)
-    regime_filter = None if regimes is None else {regime for regime in regimes if regime}
+    regime_filter = None if regimes is None else {normalize_model_variant(regime) for regime in regimes if regime}
     runs = _load_run_artifacts(
         run_roots,
         regimes=regime_filter,
@@ -692,7 +694,7 @@ def generate_training_plots(
     backbones = {run.backbone for run in runs}
     title_prefix = _paper_backbone_title(backbones)
     regimes_present = {run.regime for run in runs}
-    lbi_region_sizes = {run.region_size for run in runs if run.regime == "native_region_interface" and run.region_size is not None}
+    lbi_region_sizes = {run.region_size for run in runs if normalize_model_variant(run.regime) == LBI_VARIANT and run.region_size is not None}
     runs_by_label: Dict[str, List[RunArtifact]] = {}
     for run in runs:
         label = _label_for_run(

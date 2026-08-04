@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import importlib.util
+import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,7 +14,7 @@ from data.bpe_tokenizer import load_text_tokenizer
 from data.pretokenize_corpus import pretokenize_sentencepiece_corpus, pretokenize_text_corpus
 from scripts.plot_message_ablations import generate_message_ablation_plots
 from scripts.plot_training_curves import generate_training_plots
-from train.train_region_interface import RegionInterfaceConfig, run_training
+from train.lbi import LBITrainingConfig, run_lbi_experiment
 
 
 def _smoke_root() -> Path:
@@ -35,8 +37,8 @@ def _tiny_transformer_kwargs() -> dict[str, object]:
 def test_training_workflow_runs_dense_and_lbi_smoke(tmp_path: Path) -> None:
     smoke_root = tmp_path
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg = RegionInterfaceConfig(
-        regime="all",
+    cfg = LBITrainingConfig(
+        variants="all",
         seed=5,
         device=device,
         dtype="float32",
@@ -66,14 +68,14 @@ def test_training_workflow_runs_dense_and_lbi_smoke(tmp_path: Path) -> None:
         weight_decay=0.0,
         grad_clip=1.0,
     )
-    summary = run_training(cfg)
-    assert summary["regime"] == "all"
+    summary = run_lbi_experiment(cfg)
+    assert summary["variants"] == ["dense", "lbi"]
     assert len(summary["runs"]) == 2
-    run_by_regime = {r["regime"]: r for r in summary["runs"]}
-    assert "backprop_ref" in run_by_regime
-    assert "native_region_interface" in run_by_regime
-    run = run_by_regime["native_region_interface"]
-    ref_run = run_by_regime["backprop_ref"]
+    run_by_regime = {r["variant"]: r for r in summary["runs"]}
+    assert "dense" in run_by_regime
+    assert "lbi" in run_by_regime
+    run = run_by_regime["lbi"]
+    ref_run = run_by_regime["dense"]
     assert run["steps"] == cfg.steps
     assert math.isfinite(run["final_train_ce_loss"])
     assert math.isfinite(run["final_val_ce_loss"])
@@ -111,10 +113,144 @@ def test_training_workflow_runs_dense_and_lbi_smoke(tmp_path: Path) -> None:
     assert (ablation_dir / "ablation_summary.csv").exists()
 
 
+def test_training_workflow_runs_owned_lbi_smoke(tmp_path: Path) -> None:
+    cfg = LBITrainingConfig(
+        variants="lbi",
+        seed=17,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        dtype="float32",
+        output_dir=str(tmp_path),
+        run_name="owned_lbi_smoke",
+        **_tiny_transformer_kwargs(),
+        task="copy",
+        vocab_size=64,
+        seq_len=16,
+        train_sequences=64,
+        val_sequences=16,
+        batch_size=4,
+        steps=2,
+        eval_every=1,
+        eval_batches=1,
+        log_every=1,
+        save_every=2,
+        layers=2,
+        d_state=8,
+        region_size=1,
+        message_dim=8,
+        message_hidden_dim=16,
+        interface_jacobian_mode="recompute",
+        jacobian_basis_chunk=2,
+        log_interface_jacobian_every=1,
+        log_interface_jacobian_suffix=True,
+        include_reference_run=False,
+        lr_model=1e-3,
+        weight_decay=0.0,
+        grad_clip=1.0,
+    )
+    summary = run_lbi_experiment(cfg)
+    run = summary["runs"][0]
+    assert run["variant"] == "lbi"
+    assert run["owned_lbi_model"] is True
+    assert math.isfinite(run["final_train_ce_loss"])
+    assert math.isfinite(run["final_val_ce_loss"])
+
+    run_dir = Path(run["run_dir"])
+    model_info = json.loads((run_dir / "model_info.json").read_text(encoding="utf-8"))
+    assert model_info["model_class"] == "LBILanguageModel"
+    assert model_info["owned_lbi_model"] is True
+    assert model_info["component_params"]["interface.initial_encoder"] > 0
+    assert model_info["component_params"]["interface.decoders"] > 0
+    assert model_info["component_params"]["interface.encoders"] > 0
+
+    with (run_dir / "metrics.csv").open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    train_rows = [row for row in rows if row["split"] == "train"]
+    val_rows = [row for row in rows if row["split"] == "val"]
+    assert len(train_rows) == cfg.steps
+    assert val_rows
+    assert all(float(row["message_norm"]) > 0.0 for row in train_rows)
+    assert all(float(row["jac_local_spec_mean"]) > 0.0 for row in train_rows)
+    assert all(float(row["jac_suffix_spec_mean"]) > 0.0 for row in train_rows)
+
+    latest_checkpoint = Path(run["latest_checkpoint_path"])
+    assert latest_checkpoint.exists()
+    checkpoint = torch.load(latest_checkpoint, map_location="cpu")
+    state_keys = checkpoint["model_state_dict"].keys()
+    assert any(key.startswith("interface.") for key in state_keys)
+    assert not any(key.startswith("input_to_message") for key in state_keys)
+
+    from scripts.evaluate_paper_checkpoints import _evaluate_run
+
+    posthoc = _evaluate_run(
+        run_dir,
+        args=SimpleNamespace(
+            checkpoint="latest",
+            eval_batches=1,
+            batch_size=None,
+            seq_len=None,
+            eval_seed=123,
+            device=cfg.device,
+            tokenizer_path="",
+        ),
+    )
+    assert math.isfinite(posthoc["posthoc_val_ce_loss"])
+    assert int(posthoc["eval_tokens"]) == cfg.batch_size * cfg.seq_len
+
+
+def test_training_workflow_runs_native_lbi_smoke(tmp_path: Path) -> None:
+    # Full training loop over the autograd-free native backward: forward builds no
+    # region autograd graph, ScanADEngine.from_config selects the native providers,
+    # optimizer.step consumes the assigned grads. Transformer/fp32 avoids the
+    # mamba3 bf16-only kernels while still exercising the wiring end to end.
+    cfg = LBITrainingConfig(
+        variants="lbi",
+        seed=17,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        dtype="float32",
+        output_dir=str(tmp_path),
+        run_name="native_lbi_smoke",
+        **_tiny_transformer_kwargs(),
+        task="copy",
+        vocab_size=64,
+        seq_len=16,
+        train_sequences=64,
+        val_sequences=16,
+        batch_size=4,
+        steps=2,
+        eval_every=1,
+        eval_batches=1,
+        log_every=1,
+        save_every=2,
+        layers=2,
+        d_state=8,
+        region_size=1,
+        message_dim=8,
+        message_hidden_dim=16,
+        native_backward=True,
+        include_reference_run=False,
+        lr_model=1e-3,
+        weight_decay=0.0,
+        grad_clip=1.0,
+    )
+    summary = run_lbi_experiment(cfg)
+    run = summary["runs"][0]
+    assert run["variant"] == "lbi"
+    assert run["steps"] == cfg.steps
+    assert math.isfinite(run["final_train_ce_loss"])
+    assert math.isfinite(run["final_val_ce_loss"])
+
+    run_dir = Path(run["run_dir"])
+    with (run_dir / "metrics.csv").open("r", encoding="utf-8", newline="") as f:
+        train_rows = [row for row in csv.DictReader(f) if row["split"] == "train"]
+    assert len(train_rows) == cfg.steps
+    # The interface scan actually ran (RMS between the scanned and folded adjoints).
+    assert all(math.isfinite(float(row["message_norm"])) for row in train_rows)
+
+
 def test_train_region_interface_resume_and_init_from_checkpoint(tmp_path: Path) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    base_cfg = RegionInterfaceConfig(
-        regime="native_region_interface",
+    base_cfg = LBITrainingConfig(
+        variants="lbi",
         seed=31,
         device=device,
         dtype="float32",
@@ -142,19 +278,19 @@ def test_train_region_interface_resume_and_init_from_checkpoint(tmp_path: Path) 
         weight_decay=0.0,
         grad_clip=1.0,
     )
-    first_summary = run_training(base_cfg)
+    first_summary = run_lbi_experiment(base_cfg)
     first_run = first_summary["runs"][0]
     latest_checkpoint = first_run["latest_checkpoint_path"]
     assert Path(latest_checkpoint).exists()
 
-    resume_cfg = RegionInterfaceConfig(
+    resume_cfg = LBITrainingConfig(
         **{
             **base_cfg.to_dict(),
             "steps": 4,
             "resume_from": latest_checkpoint,
         }
     )
-    resumed_summary = run_training(resume_cfg)
+    resumed_summary = run_lbi_experiment(resume_cfg)
     resumed_run = resumed_summary["runs"][0]
     assert resumed_run["start_step"] == 2
     assert resumed_run["resumed_from"] == latest_checkpoint
@@ -166,7 +302,7 @@ def test_train_region_interface_resume_and_init_from_checkpoint(tmp_path: Path) 
     assert len(train_rows) == 4
     assert train_rows[-1]["step"] == "4"
 
-    init_cfg = RegionInterfaceConfig(
+    init_cfg = LBITrainingConfig(
         **{
             **base_cfg.to_dict(),
             "output_dir": str(tmp_path / "init_runs"),
@@ -175,7 +311,7 @@ def test_train_region_interface_resume_and_init_from_checkpoint(tmp_path: Path) 
             "init_from": latest_checkpoint,
         }
     )
-    init_summary = run_training(init_cfg)
+    init_summary = run_lbi_experiment(init_cfg)
     init_run = init_summary["runs"][0]
     assert init_run["start_step"] == 0
     assert init_run["resumed_from"] == ""
@@ -188,8 +324,8 @@ def test_train_region_interface_external_checkpoint_root(tmp_path: Path) -> None
     device = "cuda" if torch.cuda.is_available() else "cpu"
     output_root = tmp_path / "home_runs"
     checkpoint_root = tmp_path / "u2_checkpoints"
-    cfg = RegionInterfaceConfig(
-        regime="native_region_interface",
+    cfg = LBITrainingConfig(
+        variants="lbi",
         seed=41,
         device=device,
         dtype="float32",
@@ -215,7 +351,7 @@ def test_train_region_interface_external_checkpoint_root(tmp_path: Path) -> None
         message_hidden_dim=16,
         include_reference_run=False,
     )
-    summary = run_training(cfg)
+    summary = run_lbi_experiment(cfg)
     run = summary["runs"][0]
     run_dir = Path(run["run_dir"])
     best_checkpoint = Path(run["best_checkpoint_path"])
@@ -227,14 +363,14 @@ def test_train_region_interface_external_checkpoint_root(tmp_path: Path) -> None
     assert checkpoint_root in best_checkpoint.parents
     assert checkpoint_root in latest_checkpoint.parents
 
-    resumed_cfg = RegionInterfaceConfig(
+    resumed_cfg = LBITrainingConfig(
         **{
             **cfg.to_dict(),
             "steps": 3,
             "resume_from": str(run_dir),
         }
     )
-    resumed_summary = run_training(resumed_cfg)
+    resumed_summary = run_lbi_experiment(resumed_cfg)
     resumed_run = resumed_summary["runs"][0]
     assert resumed_run["start_step"] == 2
     assert resumed_run["resumed_from"] == str(latest_checkpoint)
@@ -243,8 +379,8 @@ def test_train_region_interface_external_checkpoint_root(tmp_path: Path) -> None
 
 def test_train_region_interface_backprop_ref_only_smoke(tmp_path: Path) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg = RegionInterfaceConfig(
-        regime="backprop_ref",
+    cfg = LBITrainingConfig(
+        variants="dense",
         seed=9,
         device=device,
         dtype="float32",
@@ -268,11 +404,11 @@ def test_train_region_interface_backprop_ref_only_smoke(tmp_path: Path) -> None:
         message_dim=8,
         message_hidden_dim=16,
     )
-    summary = run_training(cfg)
-    assert summary["regime"] == "backprop_ref"
+    summary = run_lbi_experiment(cfg)
+    assert summary["variants"] == ["dense"]
     assert len(summary["runs"]) == 1
     run = summary["runs"][0]
-    assert run["regime"] == "backprop_ref"
+    assert run["variant"] == "dense"
     assert math.isfinite(run["final_train_ce_loss"])
     assert math.isfinite(run["final_val_ce_loss"])
     assert Path(run["best_checkpoint_path"]).exists()
@@ -281,8 +417,8 @@ def test_train_region_interface_backprop_ref_only_smoke(tmp_path: Path) -> None:
 
 def test_train_region_interface_can_disable_checkpoint_saving(tmp_path: Path) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg = RegionInterfaceConfig(
-        regime="backprop_ref",
+    cfg = LBITrainingConfig(
+        variants="dense",
         seed=10,
         device=device,
         dtype="float32",
@@ -307,7 +443,7 @@ def test_train_region_interface_can_disable_checkpoint_saving(tmp_path: Path) ->
         message_dim=8,
         message_hidden_dim=16,
     )
-    summary = run_training(cfg)
+    summary = run_lbi_experiment(cfg)
     run = summary["runs"][0]
     run_dir = Path(run["run_dir"])
     assert run["save_checkpoints"] is False
@@ -324,7 +460,7 @@ def test_train_region_interface_can_disable_checkpoint_saving(tmp_path: Path) ->
 
 def test_fineweb_edu_requires_sharded_mode() -> None:
     with pytest.raises(ValueError, match="fineweb_edu currently requires data_mode=text_bpe_sharded"):
-        RegionInterfaceConfig(
+        LBITrainingConfig(
             data_mode="text_bpe",
             text_corpus="fineweb_edu",
             vocab_size=8192,
@@ -333,7 +469,7 @@ def test_fineweb_edu_requires_sharded_mode() -> None:
 
 def test_llama31_rejects_train_tokenizer_cfg() -> None:
     with pytest.raises(ValueError, match="llama31 tokenizer does not support --train-tokenizer"):
-        RegionInterfaceConfig(
+        LBITrainingConfig(
             data_mode="text_bpe_sharded",
             text_corpus="fineweb_edu",
             tokenizer_type="llama31",
@@ -344,7 +480,7 @@ def test_llama31_rejects_train_tokenizer_cfg() -> None:
 
 def test_llama_rejects_train_tokenizer_cfg() -> None:
     with pytest.raises(ValueError, match="llama tokenizer does not support --train-tokenizer"):
-        RegionInterfaceConfig(
+        LBITrainingConfig(
             data_mode="text_bpe_sharded",
             text_corpus="fineweb_edu",
             tokenizer_type="llama",
@@ -400,8 +536,8 @@ def test_train_region_interface_text_bpe_sharded_route_smoke(tmp_path: Path) -> 
         shard_tokens=128,
         output_dir=str(token_shards_dir),
     )
-    cfg = RegionInterfaceConfig(
-        regime="native_region_interface",
+    cfg = LBITrainingConfig(
+        variants="lbi",
         seed=22,
         device=device,
         dtype="float32",
@@ -428,9 +564,9 @@ def test_train_region_interface_text_bpe_sharded_route_smoke(tmp_path: Path) -> 
         message_hidden_dim=16,
         include_reference_run=False,
     )
-    summary = run_training(cfg)
+    summary = run_lbi_experiment(cfg)
     run = summary["runs"][0]
-    assert run["regime"] == "native_region_interface"
+    assert run["variant"] == "lbi"
     assert math.isfinite(run["final_train_ce_loss"])
     assert math.isfinite(run["final_val_ce_loss"])
     assert (token_shards_dir / "train_manifest.json").exists()
@@ -447,8 +583,8 @@ def test_train_region_interface_text_bpe_route_smoke(tmp_path: Path) -> None:
     tokenizer_path = smoke_root / "smoke_text_bpe.model"
     train_path.write_text("hello world\n" * 64 + "bounded interfaces learn\n" * 64, encoding="utf-8")
     val_path.write_text("hello bounded world\n" * 16, encoding="utf-8")
-    cfg = RegionInterfaceConfig(
-        regime="native_region_interface",
+    cfg = LBITrainingConfig(
+        variants="lbi",
         seed=21,
         device=device,
         dtype="float32",
@@ -476,9 +612,9 @@ def test_train_region_interface_text_bpe_route_smoke(tmp_path: Path) -> None:
         message_hidden_dim=16,
         include_reference_run=False,
     )
-    summary = run_training(cfg)
+    summary = run_lbi_experiment(cfg)
     run = summary["runs"][0]
-    assert run["regime"] == "native_region_interface"
+    assert run["variant"] == "lbi"
     assert math.isfinite(run["final_train_ce_loss"])
     assert math.isfinite(run["final_val_ce_loss"])
     assert tokenizer_path.exists()
@@ -491,8 +627,8 @@ def test_train_region_interface_mamba2_smoke(tmp_path: Path) -> None:
         pytest.skip("einops not installed")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     smoke_root = tmp_path
-    cfg = RegionInterfaceConfig(
-        regime="all",
+    cfg = LBITrainingConfig(
+        variants="all",
         backbone="mamba2",
         seed=11,
         device=device,
@@ -526,13 +662,13 @@ def test_train_region_interface_mamba2_smoke(tmp_path: Path) -> None:
         weight_decay=0.0,
         grad_clip=1.0,
     )
-    summary = run_training(cfg)
-    assert summary["regime"] == "all"
+    summary = run_lbi_experiment(cfg)
+    assert summary["variants"] == ["dense", "lbi"]
     assert len(summary["runs"]) == 2
-    run_by_regime = {r["regime"]: r for r in summary["runs"]}
-    assert "backprop_ref" in run_by_regime
-    assert "native_region_interface" in run_by_regime
-    run = run_by_regime["native_region_interface"]
+    run_by_regime = {r["variant"]: r for r in summary["runs"]}
+    assert "dense" in run_by_regime
+    assert "lbi" in run_by_regime
+    run = run_by_regime["lbi"]
     assert math.isfinite(run["final_train_ce_loss"])
     assert math.isfinite(run["final_val_ce_loss"])
 
@@ -540,8 +676,8 @@ def test_train_region_interface_mamba2_smoke(tmp_path: Path) -> None:
 def test_train_region_interface_transformer_smoke(tmp_path: Path) -> None:
     smoke_root = tmp_path
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg = RegionInterfaceConfig(
-        regime="all",
+    cfg = LBITrainingConfig(
+        variants="all",
         backbone="transformer",
         seed=13,
         device=device,
@@ -577,13 +713,13 @@ def test_train_region_interface_transformer_smoke(tmp_path: Path) -> None:
         weight_decay=0.0,
         grad_clip=1.0,
     )
-    summary = run_training(cfg)
-    assert summary["regime"] == "all"
+    summary = run_lbi_experiment(cfg)
+    assert summary["variants"] == ["dense", "lbi"]
     assert len(summary["runs"]) == 2
-    run_by_regime = {r["regime"]: r for r in summary["runs"]}
-    assert "backprop_ref" in run_by_regime
-    assert "native_region_interface" in run_by_regime
-    run = run_by_regime["native_region_interface"]
+    run_by_regime = {r["variant"]: r for r in summary["runs"]}
+    assert "dense" in run_by_regime
+    assert "lbi" in run_by_regime
+    run = run_by_regime["lbi"]
     assert math.isfinite(run["final_train_ce_loss"])
     assert math.isfinite(run["final_val_ce_loss"])
 
@@ -591,8 +727,8 @@ def test_train_region_interface_transformer_smoke(tmp_path: Path) -> None:
 def test_train_region_interface_hybrid_smoke(tmp_path: Path) -> None:
     smoke_root = tmp_path
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg = RegionInterfaceConfig(
-        regime="all",
+    cfg = LBITrainingConfig(
+        variants="all",
         backbone="hybrid",
         layer_types="mamba2,transformer",
         seed=19,
@@ -631,13 +767,13 @@ def test_train_region_interface_hybrid_smoke(tmp_path: Path) -> None:
         weight_decay=0.0,
         grad_clip=1.0,
     )
-    summary = run_training(cfg)
-    assert summary["regime"] == "all"
+    summary = run_lbi_experiment(cfg)
+    assert summary["variants"] == ["dense", "lbi"]
     assert len(summary["runs"]) == 2
-    run_by_regime = {r["regime"]: r for r in summary["runs"]}
-    assert "backprop_ref" in run_by_regime
-    assert "native_region_interface" in run_by_regime
-    run = run_by_regime["native_region_interface"]
+    run_by_regime = {r["variant"]: r for r in summary["runs"]}
+    assert "dense" in run_by_regime
+    assert "lbi" in run_by_regime
+    run = run_by_regime["lbi"]
     assert math.isfinite(run["final_train_ce_loss"])
     assert math.isfinite(run["final_val_ce_loss"])
 
@@ -650,8 +786,8 @@ def test_train_region_interface_mamba3_smoke(tmp_path: Path) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for mamba3 smoke")
     smoke_root = tmp_path
-    cfg = RegionInterfaceConfig(
-        regime="all",
+    cfg = LBITrainingConfig(
+        variants="all",
         backbone="mamba3",
         seed=17,
         device="cuda",
@@ -683,12 +819,12 @@ def test_train_region_interface_mamba3_smoke(tmp_path: Path) -> None:
         weight_decay=0.0,
         grad_clip=1.0,
     )
-    summary = run_training(cfg)
-    assert summary["regime"] == "all"
+    summary = run_lbi_experiment(cfg)
+    assert summary["variants"] == ["dense", "lbi"]
     assert len(summary["runs"]) == 2
-    run_by_regime = {r["regime"]: r for r in summary["runs"]}
-    assert "backprop_ref" in run_by_regime
-    assert "native_region_interface" in run_by_regime
+    run_by_regime = {r["variant"]: r for r in summary["runs"]}
+    assert "dense" in run_by_regime
+    assert "lbi" in run_by_regime
     for run in run_by_regime.values():
         assert math.isfinite(run["final_train_ce_loss"])
         assert math.isfinite(run["final_val_ce_loss"])

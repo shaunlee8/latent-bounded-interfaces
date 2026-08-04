@@ -11,17 +11,15 @@ from typing import Any
 
 import torch
 
-from backbones.general import ReferenceLM, infer_message_hidden_dim
-from models.native_region_interface import NativeRegionInterfaceModel
-from train.train_region_interface import (
-    RegionInterfaceConfig,
+from train.checkpointing import load_checkpoint as _load_checkpoint
+from train.config import DENSE_VARIANT, LBI_VARIANT, compatible_output_names_for_variant, normalize_model_variant
+from train.data import build_corpora as _build_corpora, sample_batch_any as _sample_batch_any
+from train.eval import next_token_loss as _next_token_loss
+from train.model_builders import build_model_for_regime
+from train.lbi import (
+    LBITrainingConfig,
     _autocast_context,
-    _build_corpora,
-    _load_checkpoint,
-    _make_backbone_spec,
-    _next_token_loss,
     _resolve_device,
-    _sample_batch_any,
 )
 
 
@@ -50,17 +48,20 @@ def _discover_run_dirs(family_dir: Path) -> list[Path]:
         if path.is_dir()
         and (path / "config.json").exists()
         and (path / "summary.json").exists()
-        and path.name in {"backprop_ref", "native_region_interface"}
+        and path.name in {*compatible_output_names_for_variant(DENSE_VARIANT), *compatible_output_names_for_variant(LBI_VARIANT)}
     ]
     return sorted(candidates, key=_run_sort_key)
 
 
-def _load_config(run_dir: Path, *, args: argparse.Namespace) -> RegionInterfaceConfig:
+def _load_config(run_dir: Path, *, args: argparse.Namespace) -> LBITrainingConfig:
     raw = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
-    allowed = {item.name for item in fields(RegionInterfaceConfig)}
-    cfg = RegionInterfaceConfig(**{key: value for key, value in raw.items() if key in allowed})
+    allowed = {item.name for item in fields(LBITrainingConfig)}
+    cfg = LBITrainingConfig(**{key: value for key, value in raw.items() if key in allowed})
+    variant = normalize_model_variant(run_dir.name)
 
     overrides: dict[str, Any] = {
+        "variants": variant,
+        "regime": variant,
         "eval_batches": int(args.eval_batches),
         "device": str(args.device),
     }
@@ -91,25 +92,8 @@ def _checkpoint_from_summary(run_dir: Path, checkpoint_name: str) -> Path:
     raise FileNotFoundError(f"no {checkpoint_name}.pt checkpoint found for {run_dir}")
 
 
-def _build_model(cfg: RegionInterfaceConfig) -> torch.nn.Module:
-    backbone_spec = _make_backbone_spec(cfg)
-    if cfg.regime == "backprop_ref":
-        return ReferenceLM(
-            vocab_size=cfg.vocab_size,
-            backbone_spec=backbone_spec,
-            tie_embeddings=getattr(cfg, "tie_embeddings", False),
-        )
-    if cfg.regime == "native_region_interface":
-        return NativeRegionInterfaceModel(
-            vocab_size=cfg.vocab_size,
-            region_size=cfg.region_size,
-            message_dim=cfg.message_dim,
-            backbone_spec=backbone_spec,
-            message_hidden_dim=infer_message_hidden_dim(backbone_spec, cfg.message_hidden_dim),
-            message_scale_init=cfg.message_scale_init,
-            tie_embeddings=getattr(cfg, "tie_embeddings", False),
-        )
-    raise ValueError(f"unsupported eval regime: {cfg.regime}")
+def _build_model(cfg: LBITrainingConfig, *, checkpoint: dict[str, Any]) -> torch.nn.Module:
+    return build_model_for_regime(cfg, checkpoint=checkpoint)
 
 
 def _safe_exp(value: float) -> float:
@@ -121,7 +105,7 @@ def _safe_exp(value: float) -> float:
 
 def _evaluate_loaded_model(
     *,
-    cfg: RegionInterfaceConfig,
+    cfg: LBITrainingConfig,
     model: torch.nn.Module,
     val_corpus: Any,
     generator_seed: int,
@@ -145,7 +129,7 @@ def _evaluate_loaded_model(
                 device=device,
             )
             with _autocast_context(cfg, device):
-                if isinstance(model, NativeRegionInterfaceModel):
+                if hasattr(model, "forward_with_cache"):
                     logits, _ = model.forward_with_cache(xb)
                 else:
                     logits = model(xb)
@@ -164,9 +148,9 @@ def _evaluate_loaded_model(
     }
 
 
-def _run_label(run_dir: Path, cfg: RegionInterfaceConfig) -> str:
+def _run_label(run_dir: Path, cfg: LBITrainingConfig) -> str:
     variant = run_dir.parent.name
-    if cfg.regime == "backprop_ref":
+    if normalize_model_variant(cfg.regime) == DENSE_VARIANT:
         return variant.replace("dense_", "dense_")
     return variant
 
@@ -183,7 +167,7 @@ def _evaluate_run(run_dir: Path, *, args: argparse.Namespace) -> dict[str, Any]:
     checkpoint_path = _checkpoint_from_summary(run_dir, args.checkpoint)
     checkpoint = _load_checkpoint(checkpoint_path, device=device)
 
-    model = _build_model(cfg).to(device=device, dtype=torch.float32)
+    model = _build_model(cfg, checkpoint=checkpoint).to(device=device, dtype=torch.float32)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     _, val_corpus = _build_corpora(cfg, device=device)
@@ -200,11 +184,12 @@ def _evaluate_run(run_dir: Path, *, args: argparse.Namespace) -> dict[str, Any]:
     row: dict[str, Any] = {
         "label": _run_label(run_dir, cfg),
         "run_dir": str(run_dir),
+        "variant": normalize_model_variant(cfg.regime),
         "regime": cfg.regime,
         "backbone": cfg.backbone,
         "seed": cfg.seed,
-        "message_dim": cfg.message_dim if cfg.regime == "native_region_interface" else "",
-        "region_size": cfg.region_size if cfg.regime == "native_region_interface" else "",
+        "message_dim": cfg.message_dim if normalize_model_variant(cfg.regime) == LBI_VARIANT else "",
+        "region_size": cfg.region_size if normalize_model_variant(cfg.regime) == LBI_VARIANT else "",
         "checkpoint": args.checkpoint,
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_step": int(checkpoint.get("step", -1)),

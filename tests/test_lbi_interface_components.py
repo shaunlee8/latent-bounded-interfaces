@@ -7,7 +7,7 @@ import torch
 
 from backbones.general import BackboneSpec, ReferenceLM, build_backbone_stack
 from backbones.mamba3 import Mamba3, Mamba3Block
-from models.native_region_interface import NativeRegionInterfaceModel, RegionMessageHead
+from legacy.native_region_interface import NativeRegionInterfaceModel, RegionMessageHead
 
 
 def _build_model() -> NativeRegionInterfaceModel:

@@ -109,6 +109,8 @@ def run_dense_training(cfg: LBITrainingConfig, *, run_dir: Path) -> Dict[str, An
         torch.cuda.manual_seed_all(cfg.seed)
 
     model = build_dense_model(cfg).to(device=device, dtype=torch.float32)
+    if cfg.compile_dense:
+        model = torch.compile(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr_model, weight_decay=cfg.weight_decay)
     ad_engine = AutogradEngine()
     train_corpus, val_corpus = _build_corpora(cfg, device=device)
@@ -296,10 +298,32 @@ def run_lbi_training(cfg: LBITrainingConfig, *, run_dir: Path) -> Dict[str, Any]
     if device.type == "cuda":
         torch.cuda.manual_seed_all(cfg.seed)
 
-    model = build_lbi_model(cfg).to(device=device, dtype=torch.float32)
+    # The native backward runs the region kernels in the model's own dtype (no
+    # autocast), so it needs the params in that dtype -- mamba3's native kernels
+    # are bf16-only. Non-native training keeps the fp32-master + autocast path.
+    if cfg.native_backward:
+        model_dtype = torch.bfloat16 if cfg.dtype == "bfloat16" else torch.float32
+    else:
+        model_dtype = torch.float32
+    model = build_lbi_model(cfg).to(device=device, dtype=model_dtype)
     if not isinstance(model, LBILanguageModel):
         raise TypeError("LBI training requires LBILanguageModel")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr_model, weight_decay=cfg.weight_decay)
+    if str(cfg.interface_jacobian_mode).lower() in {"forward", "forward_mode", "fwd", "jvp"}:
+        model.region_backend.forward_mode_use_kernel = True
+    if cfg.compile_turn:
+        model.region_backend.compile_forward_stages = True
+
+    # Native mode runs the model in bf16; fp32_master keeps the optimizer on
+    # fp32 copies (grads cast up per step, updated masters copied back down)
+    # so both training arms share the fp32-master precision regime.
+    params = list(model.parameters())
+    masters = None
+    if cfg.native_backward and cfg.fp32_master and model_dtype is torch.bfloat16:
+        masters = [p.detach().clone().float().requires_grad_(False) for p in params]
+        opt_params = masters
+    else:
+        opt_params = params
+    optimizer = torch.optim.AdamW(opt_params, lr=cfg.lr_model, weight_decay=cfg.weight_decay)
     train_corpus, val_corpus = _build_corpora(cfg, device=device)
     _write_run_metadata(
         cfg=cfg,
@@ -329,6 +353,12 @@ def run_lbi_training(cfg: LBITrainingConfig, *, run_dir: Path) -> Dict[str, Any]
         train_generator=train_gen,
         eval_generator=eval_gen,
     )
+    if masters is not None:
+        # Restored (or freshly built) weights are the source of truth; the
+        # fp32 masters mirror them from here on.
+        with torch.no_grad():
+            for mp, p in zip(masters, params):
+                mp.copy_(p.float())
 
     metrics_csv = run_dir / "metrics.csv"
     metrics_jsonl = run_dir / "metrics.jsonl"
@@ -347,6 +377,14 @@ def run_lbi_training(cfg: LBITrainingConfig, *, run_dir: Path) -> Dict[str, Any]
     initialized_from = str(restore["checkpoint_path"]) if cfg.init_from else ""
     _set_optimizer_lr(optimizer, _scheduled_lr(cfg, start_step))
 
+    autograd_backward = str(cfg.lbi_backward).lower() == "autograd"
+    if autograd_backward and cfg.native_backward:
+        raise ValueError("lbi_backward='autograd' requires the graph forward (native_backward=False)")
+    _base_engine = _stats_engine = None
+    if not autograd_backward:
+        _base_engine = ScanADEngine.from_config(cfg, compute_interface_jacobian_stats=False)
+        _stats_engine = ScanADEngine.from_config(cfg, compute_interface_jacobian_stats=True)
+
     for step in range(start_step + 1, cfg.steps + 1):
         t0 = time.perf_counter()
         model.train()
@@ -358,26 +396,47 @@ def run_lbi_training(cfg: LBITrainingConfig, *, run_dir: Path) -> Dict[str, Any]
             generator=train_gen,
             device=device,
         )
-        with _autocast_context(cfg, device):
-            logits, cache = model.forward_with_cache(xb)
+        # Native mode runs in the model's uniform dtype (no autocast) so the frozen
+        # cache stays in one dtype for the native kernels; otherwise use autocast.
+        forward_ctx = nullcontext() if cfg.native_backward else _autocast_context(cfg, device)
+        with forward_ctx:
+            logits, cache = model.forward_with_cache(
+                xb,
+                native_backward=cfg.native_backward,
+                trim_region_cache=cfg.trim_region_cache,
+            )
         ce_loss = _next_token_loss(logits, yb)
         log_interface_jacobian = (
             cfg.log_interface_jacobian_every > 0
             and ((step % cfg.log_interface_jacobian_every) == 0 or step == 1 or step == cfg.steps)
         )
-        ad_engine = ScanADEngine.from_config(
-            cfg,
-            compute_interface_jacobian_stats=log_interface_jacobian,
-        )
-        ad_result = ad_engine.backward(model=model, loss=ce_loss, cache=cache)
-        interface_scan_rms = float(ad_result.diagnostics.get("interface_scan_rms", 0.0))
-        interface_jacobian_stats = ad_result.diagnostics.get("interface_jacobian_stats")
+        if autograd_backward:
+            for p in params:
+                p.grad = None
+            ce_loss.backward()
+            interface_scan_rms = 0.0
+            interface_jacobian_stats = None
+        else:
+            ad_engine = _stats_engine if log_interface_jacobian else _base_engine
+            ad_result = ad_engine.backward(model=model, loss=ce_loss, cache=cache)
+            interface_scan_rms = float(ad_result.diagnostics.get("interface_scan_rms", 0.0))
+            interface_jacobian_stats = ad_result.diagnostics.get("interface_jacobian_stats")
         if interface_jacobian_stats is not None:
             final_interface_jacobian_stats = dict(interface_jacobian_stats)
 
-        if cfg.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        optimizer.step()
+        if masters is not None:
+            for mp, p in zip(masters, params):
+                mp.grad = None if p.grad is None else p.grad.float()
+            if cfg.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(masters, cfg.grad_clip)
+            optimizer.step()
+            with torch.no_grad():
+                for mp, p in zip(masters, params):
+                    p.copy_(mp.to(p.dtype))
+        else:
+            if cfg.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            optimizer.step()
         t1 = time.perf_counter()
 
         final_train = float(ce_loss.item())

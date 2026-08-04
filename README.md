@@ -25,47 +25,29 @@ CUDA extensions are documented under `cuda/README.md`.
 Current CUDA extensions:
 
 - `cuda/interface/`: suffix-scan composition for bounded-interface pullback matrices.
-- `cuda/transformer/`: Transformer attention input-pullback kernels.
+- `cuda/mamba3/`: Mamba-3 forward-mode kernels (lane-batched dual walk, dual-scan forward, chunk-parallel pass C).
+- `cuda/transformer/`: flash-JVP attention tangent kernel (primary on Hopper; triton alternative in `backbones/transformer/ops/triton/`).
 
 Build commands:
 
 ```bash
 PYTHON_BIN=${PYTHON_BIN:-python} ./cuda/interface/build.sh
+PYTHON_BIN=${PYTHON_BIN:-python} ./cuda/mamba3/build.sh
 PYTHON_BIN=${PYTHON_BIN:-python} ./cuda/transformer/build.sh
-```
-
-The Transformer CUDA extension requires CUTLASS/CuTe. Initialize the submodule before building if needed:
-
-```bash
-git submodule update --init --recursive third_party/cutlass
 ```
 
 ## Tests
 
-Core LBI-2 tests are not yet available.
-
-CUDA tests:
-
 ```bash
-${PYTHON_BIN:-python} -m pytest \
-  tests/test_interface_scan.py \
-  tests/test_cuda_attention_pullback.py \
-  -q
+${PYTHON_BIN:-python} -m pytest tests/ -q
 ```
 
-Transformer attention pullback timing:
+## Benchmarks
 
-```bash
-${PYTHON_BIN:-python} benchmarks/time_attention_pullback.py \
-  --seq-lens 128 \
-  --head-dims 64 \
-  --basis-sizes 4 \
-  --dtype float16 \
-  --skip-torch-formula \
-  --include-fa2-loop \
-  --include-autograd \
-  --check
-```
+- `benchmarks/sharded_forward_region_parallel.py`: the production distributed training step — region-sharded forward chain plus bubble-free region-parallel backward (multi-GPU, NCCL).
+- `benchmarks/nccl_region_parallel.py`: backward-only region-parallel row (mamba3 and transformer backbones).
+- `benchmarks/pipeline_parallel_baseline.py`: GPipe-style pipeline baseline over the same stack.
+- `benchmarks/dense_sequential_baseline.py`: single-GPU dense sequential backprop row (no interfaces).
 
 ## Third-Party Code
 
@@ -76,8 +58,6 @@ https://github.com/state-spaces/mamba
 ```
 
 The upstream Mamba code is licensed under Apache-2.0. See `THIRD_PARTY_NOTICES.md` and `third_party_licenses/mamba/LICENSE` for attribution and license details.
-
-This branch also uses CUTLASS/CuTe for Transformer CUDA kernels via `third_party/cutlass`.
 
 ## License
 

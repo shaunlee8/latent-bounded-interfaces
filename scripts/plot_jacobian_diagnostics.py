@@ -84,7 +84,7 @@ def _discover_runs(root: Path, *, include_rank_regex: str = "") -> List[Jacobian
         raise FileNotFoundError(f"run root does not exist: {root}")
     rank_re = re.compile(include_rank_regex) if include_rank_regex else None
     runs: List[JacobianRun] = []
-    for metrics_path in sorted(root.glob("lbi_r*_jac_seed*/native_region_interface/metrics.csv")):
+    for metrics_path in sorted(list(root.glob("lbi_r*_jac_seed*/lbi/metrics.csv")) + list(root.glob("lbi_r*_jac_seed*/native_region_interface/metrics.csv"))):
         match = _RUN_RE.search(str(metrics_path))
         if match is None:
             continue
