@@ -5,6 +5,8 @@ from typing import Any
 import torch.nn as nn
 
 from backbones.general import BackboneSpec, infer_message_hidden_dim
+from interfaces.attentive import AttentiveInterface
+from interfaces.base import InterfaceModule
 from interfaces.vector_mlp import VectorMLPInterface
 from models.dense_language_model import DenseLanguageModel
 from models.lbi_language_model import LBILanguageModel, build_region_ranges
@@ -52,23 +54,57 @@ def build_dense_model(cfg: Any, *, backbone_spec: BackboneSpec | None = None) ->
     )
 
 
-def build_lbi_language_model(cfg: Any, *, backbone_spec: BackboneSpec | None = None) -> LBILanguageModel:
-    if backbone_spec is None:
-        backbone_spec = build_backbone_spec(cfg)
-    region_ranges = build_region_ranges(backbone_spec.layers, int(cfg.region_size))
-    interface = VectorMLPInterface(
+def build_interface(cfg: Any, *, backbone_spec: BackboneSpec, num_regions: int) -> InterfaceModule:
+    interface_type = str(getattr(cfg, "interface_type", "vector_mlp"))
+    chunks = int(getattr(cfg, "interface_chunks", 1))
+    if interface_type == "attentive" and chunks > 1:
+        from interfaces.chunked import ChunkedAttentiveInterface
+
+        return ChunkedAttentiveInterface(
+            feature_dim=backbone_spec.dim,
+            num_regions=num_regions,
+            chunk_count=chunks,
+            chunk_width=int(cfg.message_dim),
+            attn_dim=int(getattr(cfg, "interface_attn_dim", 64)),
+            update_scale_init=float(cfg.message_scale_init),
+            strict_causal=bool(getattr(cfg, "interface_chunks_strict", False)),
+            chunk_norm=str(getattr(cfg, "interface_chunk_norm", "layer")),
+        )
+    if interface_type == "attentive":
+        return AttentiveInterface(
+            feature_dim=backbone_spec.dim,
+            num_regions=num_regions,
+            interface_width=int(cfg.message_dim),
+            attn_dim=int(getattr(cfg, "interface_attn_dim", 64)),
+            update_scale_init=float(cfg.message_scale_init),
+        )
+    if interface_type != "vector_mlp":
+        raise ValueError(f"unsupported interface_type: {interface_type}")
+    return VectorMLPInterface(
         feature_dim=backbone_spec.dim,
-        num_regions=len(region_ranges),
+        num_regions=num_regions,
         interface_width=int(cfg.message_dim),
         interface_map_hidden_dim=infer_message_hidden_dim(backbone_spec, int(cfg.message_hidden_dim)),
         update_scale_init=float(cfg.message_scale_init),
     )
+
+
+def build_lbi_language_model(cfg: Any, *, backbone_spec: BackboneSpec | None = None) -> LBILanguageModel:
+    if backbone_spec is None:
+        backbone_spec = build_backbone_spec(cfg)
+    region_ranges = build_region_ranges(backbone_spec.layers, int(cfg.region_size))
+    interface = build_interface(cfg, backbone_spec=backbone_spec, num_regions=len(region_ranges))
     return LBILanguageModel(
         vocab_size=int(cfg.vocab_size),
         layers_per_region=int(cfg.region_size),
         backbone_spec=backbone_spec,
         interface=interface,
         tie_embeddings=bool(getattr(cfg, "tie_embeddings", False)),
+        canvas_local_mixer=int(getattr(cfg, "canvas_local_mixer", 0)),
+        canvas_region_view=bool(getattr(cfg, "canvas_region_view", False)),
+        canvas_state_readout=bool(getattr(cfg, "canvas_state_readout", False)),
+        canvas_output_readout=bool(getattr(cfg, "canvas_output_readout", False)),
+        state_readout_attn_dim=int(getattr(cfg, "interface_attn_dim", 64)),
     )
 
 

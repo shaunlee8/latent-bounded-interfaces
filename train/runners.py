@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -380,6 +381,8 @@ def run_lbi_training(cfg: LBITrainingConfig, *, run_dir: Path) -> Dict[str, Any]
     autograd_backward = str(cfg.lbi_backward).lower() == "autograd"
     if autograd_backward and cfg.native_backward:
         raise ValueError("lbi_backward='autograd' requires the graph forward (native_backward=False)")
+    if cfg.compile_turn:
+        os.environ.setdefault("LBI_INTERFACE_COMPILE", "1")
     _base_engine = _stats_engine = None
     if not autograd_backward:
         _base_engine = ScanADEngine.from_config(cfg, compute_interface_jacobian_stats=False)
@@ -400,10 +403,14 @@ def run_lbi_training(cfg: LBITrainingConfig, *, run_dir: Path) -> Dict[str, Any]
         # cache stays in one dtype for the native kernels; otherwise use autocast.
         forward_ctx = nullcontext() if cfg.native_backward else _autocast_context(cfg, device)
         with forward_ctx:
+            # Scan engines need boundary-state readout taps severed from the
+            # chain (their cotangents become the scan's source terms).
             logits, cache = model.forward_with_cache(
                 xb,
+                message_ablation=getattr(cfg, "train_message_ablation", "none"),
                 native_backward=cfg.native_backward,
                 trim_region_cache=cfg.trim_region_cache,
+                detach_state_taps=not autograd_backward,
             )
         ce_loss = _next_token_loss(logits, yb)
         log_interface_jacobian = (

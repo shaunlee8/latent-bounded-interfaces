@@ -53,8 +53,25 @@ def _discover_run_dirs(family_dir: Path) -> list[Path]:
     return sorted(candidates, key=_run_sort_key)
 
 
+# Saved configs predating an interface/canvas field must rebuild with that
+# era's behavior, not today's defaults.
+_LEGACY_CONFIG_DEFAULTS = {
+    "interface_type": "vector_mlp",
+    "interface_chunks": 1,
+    "interface_chunks_strict": False,
+    "interface_chunk_norm": "layer",
+    "canvas_output_readout": False,
+    "canvas_state_readout": False,
+    "canvas_region_view": False,
+    "canvas_local_mixer": 0,
+    "message_dim": 64,
+}
+
+
 def _load_config(run_dir: Path, *, args: argparse.Namespace) -> LBITrainingConfig:
     raw = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+    for key, value in _LEGACY_CONFIG_DEFAULTS.items():
+        raw.setdefault(key, value)
     allowed = {item.name for item in fields(LBITrainingConfig)}
     cfg = LBITrainingConfig(**{key: value for key, value in raw.items() if key in allowed})
     variant = normalize_model_variant(run_dir.name)

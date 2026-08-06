@@ -131,6 +131,14 @@ def infer_model_info(cfg: Any, *, model: nn.Module) -> dict[str, Any]:
             "readout.norm": norm_params,
             "readout.lm_head": lm_head_params,
         }
+        if getattr(model, "state_readout", None) is not None:
+            info["component_params"]["readout.state_readout"] = count_parameters(model.state_readout)
+        if getattr(model.canvas, "local_mixer", None) is not None:
+            info["component_params"]["canvas.local_mixer"] = count_parameters(model.canvas.local_mixer)
+        if getattr(model, "canvas_view_gain", None) is not None:
+            info["component_params"]["canvas.region_view"] = int(
+                sum(p.numel() for p in model.canvas_view_gain) + sum(p.numel() for p in model.canvas_view_bias)
+            )
         info["lm_head_tied_to_embedding"] = readout_uses_tied_output_weight(model)
         info["owned_lbi_model"] = True
     elif isinstance(model, DenseLanguageModel):

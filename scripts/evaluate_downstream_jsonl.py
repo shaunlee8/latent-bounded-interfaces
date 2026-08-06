@@ -208,12 +208,13 @@ def _evaluate_examples(
 
 
 def _evaluate_run(run_dir: Path, *, args: argparse.Namespace, examples: list[dict[str, Any]]) -> dict[str, Any]:
-    cfg_args = argparse.Namespace(eval_batches=1, batch_size=1, seq_len=args.seq_len, device=args.device)
+    cfg_args = argparse.Namespace(eval_batches=1, batch_size=1, seq_len=args.seq_len,
+                                  device=args.device, tokenizer_path=args.tokenizer_path)
     cfg = _load_config(run_dir, args=cfg_args)
     device = _resolve_device(cfg)
     checkpoint_path = _checkpoint_from_summary(run_dir, args.checkpoint)
     checkpoint = _load_checkpoint(checkpoint_path, device=device)
-    model = _build_model(cfg).to(device=device, dtype=torch.float32)
+    model = _build_model(cfg, checkpoint=checkpoint).to(device=device, dtype=torch.float32)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     tokenizer = _load_tokenizer_for_cfg(cfg)
@@ -273,6 +274,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", choices=("best", "latest"), default="best")
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument("--seq-len", type=int, default=None)
+    parser.add_argument("--tokenizer-path", type=str, default="")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--score-normalization", choices=("mean", "sum"), default="mean")
     parser.add_argument("--run-dir", action="append", default=[])

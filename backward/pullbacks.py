@@ -26,8 +26,10 @@ def _forward_region_state_map(
     canvas_features: torch.Tensor,
     state_in: torch.Tensor,
 ) -> torch.Tensor:
-    condition = model.interface.decode(state_in, region_index)
-    region_input = canvas_features + condition.unsqueeze(1)
+    condition = model.interface.decode(state_in, region_index, canvas_features=canvas_features)
+    viewed = getattr(model, "viewed_canvas", None)
+    canvas_read = viewed(canvas_features, region_index) if viewed is not None else canvas_features
+    region_input = canvas_read + (condition if condition.dim() == 3 else condition.unsqueeze(1))
     region_output, _ = model.region_backend.forward_region(
         region_input=region_input,
         region_index=region_index,
@@ -227,26 +229,100 @@ def interface_state_jacobian_for_region_forward(
 
     The returned tensor matches the reverse providers EXACTLY (same object,
     opposite mode): update JVP output U[b, p=i, o] = d state_out_o / d state_in_i
-    = (A_k^T)[i, o], no transpose needed."""
+    = (A_k^T)[i, o], no transpose needed.
+
+    Interfaces exposing `state_tangent_support_starts` (per-coordinate first
+    token of nonzero decode tangent, e.g. strict chunk-causal decodes) get a
+    lane-restricted construction: coordinates with an empty decode path skip
+    the decode/region/update chain entirely and take the closed-form skip +
+    norm row instead. Exact; only the zero lanes are dropped."""
     state_in = region_cache.state_in
     if state_in.dim() != 2:
         raise ValueError("interface state inputs must be [B, R].")
     bsz, rank = state_in.shape
     # Identity basis on the state INPUT: [B, P=rank, R], column j = e_j.
     eye = torch.eye(rank, device=state_in.device, dtype=state_in.dtype)
-    state_in_basis = eye.unsqueeze(0).expand(bsz, rank, rank)
 
+    active_idx = idle_idx = None
+    support_fn = getattr(model.interface, "state_tangent_support_starts", None)
+    if support_fn is not None:
+        seq_len = int(region_cache.canvas_features.shape[1])
+        starts = support_fn(seq_len).to(device=state_in.device)
+        idle = starts >= seq_len
+        if bool(idle.any()):
+            active_idx = torch.nonzero(~idle).squeeze(-1)
+            idle_idx = torch.nonzero(idle).squeeze(-1)
+
+    if active_idx is None:
+        state_in_basis = eye.unsqueeze(0).expand(bsz, rank, rank)
+        decode = model.interface.apply_decode_jacobian_to_state_input(
+            region_cache=region_cache,
+            state_input_tangent_basis=state_in_basis,
+        )
+        d_region_output = region_output_jvp(decode["d_region_input"])
+        update = model.interface.apply_update_jacobian_to_region_output(
+            region_cache=region_cache,
+            region_output_tangent_basis=d_region_output,
+            state_input_tangent_basis=state_in_basis,
+        )
+        return update["d_state_out"].contiguous().to(dtype=state_in.dtype)
+
+    basis_active = eye[active_idx].unsqueeze(0).expand(bsz, active_idx.shape[0], rank)
     decode = model.interface.apply_decode_jacobian_to_state_input(
         region_cache=region_cache,
-        state_input_tangent_basis=state_in_basis,
+        state_input_tangent_basis=basis_active,
     )
-    d_region_output = region_output_jvp(decode["d_region_input"])
+    # Suffix-aware region JVP: lanes grouped by their common support start so
+    # backends that honor `tangent_token_start` compute only each group's
+    # token suffix. Callables without the kwarg get one plain full call.
+    import inspect
+
+    try:
+        params = inspect.signature(region_output_jvp).parameters
+        accepts_start = "tangent_token_start" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+    except (TypeError, ValueError):
+        accepts_start = False
+    if accepts_start:
+        starts_active = starts[active_idx]
+        d_in = decode["d_region_input"]
+        groups: list[tuple[int, int, int]] = []
+        lo = 0
+        for p in range(1, starts_active.shape[0] + 1):
+            if p == starts_active.shape[0] or starts_active[p] != starts_active[lo]:
+                groups.append((lo, p, int(starts_active[lo])))
+                lo = p
+        if len(groups) == 1:
+            d_region_output = region_output_jvp(d_in, tangent_token_start=groups[0][2])
+        else:
+            parts = [
+                region_output_jvp(d_in[:, g_lo:g_hi], tangent_token_start=g_s)
+                for g_lo, g_hi, g_s in groups
+            ]
+            if isinstance(parts[0], tuple):
+                d_region_output = (
+                    torch.cat([p[0] for p in parts], dim=1),
+                    torch.cat([p[1] for p in parts], dim=1) if parts[0][1] is not None else None,
+                )
+            else:
+                d_region_output = torch.cat(parts, dim=1)
+    else:
+        d_region_output = region_output_jvp(decode["d_region_input"])
     update = model.interface.apply_update_jacobian_to_region_output(
         region_cache=region_cache,
         region_output_tangent_basis=d_region_output,
-        state_input_tangent_basis=state_in_basis,
+        state_input_tangent_basis=basis_active,
     )
-    return update["d_state_out"].contiguous().to(dtype=state_in.dtype)
+    basis_idle = eye[idle_idx].unsqueeze(0).expand(bsz, idle_idx.shape[0], rank)
+    skip = model.interface.apply_update_jacobian_skip_only(
+        region_cache=region_cache,
+        state_input_tangent_basis=basis_idle,
+    )
+    rows = torch.empty(bsz, rank, rank, device=state_in.device, dtype=state_in.dtype)
+    rows[:, active_idx] = update["d_state_out"].to(dtype=state_in.dtype)
+    rows[:, idle_idx] = skip["d_state_out"].to(dtype=state_in.dtype)
+    return rows.contiguous()
 
 
 class NativeInterfacePullbackProvider:
@@ -255,12 +331,15 @@ class NativeInterfacePullbackProvider:
     def __init__(self, *, basis_chunk: int = 1) -> None:
         self.basis_chunk = int(basis_chunk)
 
+    @torch.no_grad()
     def materialize_state_jacobian_t(
         self,
         *,
         model: Any,
         cache: dict[str, Any],
     ) -> list[torch.Tensor]:
+        # no_grad is load-bearing (see the forward provider); helpers that
+        # need autograd re-enable it locally.
         del self
         return materialize_interface_state_jacobian_t_native(model=model, cache=cache)
 
@@ -293,12 +372,15 @@ class ForwardModeInterfacePullbackProvider:
                 return
         backend.forward_mode_use_kernel = True
 
+    @torch.no_grad()
     def materialize_state_jacobian_t(
         self,
         *,
         model: Any,
         cache: dict[str, Any],
     ) -> list[torch.Tensor]:
+        # no_grad is load-bearing: the JVP chain reads live parameters, so
+        # recording it would retain every region's tangent transients at once.
         self._enable_kernel_path(model)
         region_caches: Sequence[Any] = cache["region_caches"]
         if len(region_caches) != model.num_regions:
@@ -310,16 +392,38 @@ class ForwardModeInterfacePullbackProvider:
                 "(the native forward-mode scan). No autograd fallback."
             )
 
-        # The region tangent's only consumer is the update-JVP meanpool, so
-        # request the pooled tangent [B, P, 1, D] (LBI_FWDMODE_POOLED=0 escapes).
-        pooled = os.environ.get("LBI_FWDMODE_POOLED", "1") == "1"
+        # The region tangent's only consumers are pooling contractions, so ask
+        # the backend for the reduced form: the meanpool [B, P, 1, D] for
+        # broadcast interfaces (LBI_FWDMODE_POOLED=0 escapes), the projected
+        # value/score rows + RMS inner products for token-wise interfaces
+        # (LBI_FWDMODE_PROJ=0 escapes to the full [B, P, L, D] basis).
+        tokenwise = bool(getattr(model.interface.spec, "condition_is_tokenwise", False))
+        pooled = os.environ.get("LBI_FWDMODE_POOLED", "1") == "1" and not tokenwise
+        projection_fn = (
+            getattr(model.interface, "update_tangent_projection", None)
+            if tokenwise and os.environ.get("LBI_FWDMODE_PROJ", "1") == "1"
+            else None
+        )
         jacobians: list[torch.Tensor] = []
         for region_cache in region_caches:
-            def _jvp(region_input_tangent_basis: torch.Tensor, _rc: Any = region_cache) -> torch.Tensor:
+            projection = inner_map = None
+            if projection_fn is not None:
+                projection, inner_map = projection_fn(region_cache)
+
+            def _jvp(
+                region_input_tangent_basis: torch.Tensor,
+                _rc: Any = region_cache,
+                _proj: Any = projection,
+                _inner: Any = inner_map,
+                tangent_token_start: int = 0,
+            ) -> Any:
                 return region_output_jvp(
                     cache=_rc.backend_cache,
                     region_input_tangent_basis=region_input_tangent_basis,
                     pooled=pooled,
+                    output_projection=_proj,
+                    output_inner=_inner,
+                    tangent_token_start=tangent_token_start,
                 )
 
             jacobians.append(

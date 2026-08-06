@@ -41,23 +41,26 @@ def _module_input_jacobian_t_apply_autograd(
     if g_out.dim() != 3:
         raise ValueError("module input Jacobian-transpose apply expects g_out shaped [B, P, D_out].")
     bsz, basis = g_out.shape[:2]
-    x_rep = (
-        x.detach()
-        .unsqueeze(1)
-        .expand(bsz, basis, x.shape[-1])
-        .reshape(bsz * basis, x.shape[-1])
-        .requires_grad_(True)
-    )
-    y_rep = module(x_rep)
-    g_rep = g_out.to(device=y_rep.device, dtype=y_rep.dtype).reshape_as(y_rep)
-    g_in = torch.autograd.grad(
-        y_rep,
-        x_rep,
-        grad_outputs=g_rep,
-        retain_graph=False,
-        create_graph=False,
-        allow_unused=False,
-    )[0]
+    # This helper builds its own local graph, so it must work even when the
+    # caller runs under no_grad (the structured-pullback providers do).
+    with torch.enable_grad():
+        x_rep = (
+            x.detach()
+            .unsqueeze(1)
+            .expand(bsz, basis, x.shape[-1])
+            .reshape(bsz * basis, x.shape[-1])
+            .requires_grad_(True)
+        )
+        y_rep = module(x_rep)
+        g_rep = g_out.to(device=y_rep.device, dtype=y_rep.dtype).reshape_as(y_rep)
+        g_in = torch.autograd.grad(
+            y_rep,
+            x_rep,
+            grad_outputs=g_rep,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=False,
+        )[0]
     return g_in.reshape(bsz, basis, x.shape[-1]).to(device=g_out.device, dtype=g_out.dtype)
 
 
@@ -280,7 +283,14 @@ class VectorMLPInterface(InterfaceModule):
     def initialize(self, canvas_features: torch.Tensor) -> torch.Tensor:
         return self.initial_encoder(self.summarize_features(canvas_features))
 
-    def decode(self, state: torch.Tensor, region_index: int) -> torch.Tensor:
+    def decode(
+        self,
+        state: torch.Tensor,
+        region_index: int,
+        *,
+        canvas_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del canvas_features
         return self.decoders[region_index](state)
 
     def update(

@@ -11,6 +11,7 @@ from backward.pullbacks import InterfacePullbackProvider, build_interface_pullba
 from backward.suffix_scan import (
     apply_jacobian_t,
     interface_state_jacobian_t_stats,
+    propagate_state_adjoint_affine,
     propagate_state_adjoint_from_last_region_input,
 )
 
@@ -37,12 +38,57 @@ def lbi_scan_backward_step(
 
     local_vjp_provider.store_output_head_grads(model=model, loss=ce_loss, grad_map=grad_map, cache=cache)
 
-    if num_regions == 1:
+    # Boundary-state readout taps (if any) contribute direct per-state adjoints:
+    # the scan becomes affine and the last state's adjoint seeds the last
+    # region's update path. The taps must be severed leaves — with a live chain
+    # the direct terms would be double-counted.
+    state_taps = list(cache.get("state_taps") or [])
+    if state_taps and any(not (tap.is_leaf and tap.requires_grad) for tap in state_taps):
+        raise ValueError("scan backward requires detached state taps (forward with detach_state_taps=True)")
+    state_sources = (
+        list(torch.autograd.grad(ce_loss, state_taps, retain_graph=True, allow_unused=False))
+        if state_taps
+        else None
+    )
+    # Output-readout taps: their direct cotangents (one shared g_stream scaled
+    # by each gate) pull back through decode^T J^T to input-side scan sources.
+    output_taps = list(cache.get("output_taps") or [])
+    if output_taps and any(not (tap.is_leaf and tap.requires_grad) for tap in output_taps):
+        raise ValueError("scan backward requires detached output taps (forward with detach_state_taps=True)")
+    input_sources = None
+    if output_taps:
+        tap_grads = list(torch.autograd.grad(ce_loss, output_taps, retain_graph=True, allow_unused=False))
+        cache["output_tap_grads"] = tap_grads
+        input_sources = local_vjp_provider.output_tap_state_sources(
+            model=model, cache=cache, tap_grads=tap_grads
+        )
+
+    if num_regions == 1 and state_sources is None and input_sources is None:
         g_state_inputs = [
             local_vjp_provider.state_adjoint_from_loss(model=model, loss=ce_loss, state=states[0], cache=cache)
         ]
         interface_scan_rms = 0.0
         interface_jacobian_stats = None
+    elif state_sources is not None or input_sources is not None:
+        g_last_input = local_vjp_provider.state_adjoint_from_loss(model=model, loss=ce_loss, state=states[-2], cache=cache)
+        state_jacobians_t = pullback_provider.materialize_state_jacobian_t(model=model, cache=cache)
+        interface_jacobian_stats = (
+            interface_state_jacobian_t_stats(
+                state_jacobians_t,
+                include_suffix=include_interface_jacobian_suffix,
+            )
+            if compute_interface_jacobian_stats
+            else None
+        )
+        adjoints = propagate_state_adjoint_affine(
+            state_jacobians_t,
+            g_last_input,
+            state_sources,
+            num_regions=num_regions,
+            input_sources=input_sources,
+        )
+        g_state_inputs = adjoints  # length num_regions + 1; the extra entry is lambda_K
+        interface_scan_rms = 0.0
     else:
         g_last_input = local_vjp_provider.state_adjoint_from_loss(model=model, loss=ce_loss, state=states[-2], cache=cache)
         state_jacobians_t = pullback_provider.materialize_state_jacobian_t(model=model, cache=cache)

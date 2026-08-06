@@ -79,6 +79,59 @@ def propagate_state_adjoint_from_last_region_input(
     ]
 
 
+def propagate_state_adjoint_affine(
+    state_jacobians_t: Sequence[torch.Tensor],
+    g_last_input_state: torch.Tensor,
+    state_sources: "Sequence[torch.Tensor] | None",
+    *,
+    num_regions: int,
+    input_sources: "Sequence[torch.Tensor] | None" = None,
+) -> list[torch.Tensor]:
+    """Affine state-adjoint recursion for models whose boundary states also
+    feed the loss directly: lambda_k = A_k^T lambda_{k+1} + b_k.
+    `state_sources[k]` is the direct adjoint of region k's OUTPUT state
+    (boundary-state readout taps); `input_sources[k]` is the direct adjoint of
+    region k's INPUT state (the output-readout path decode^T J^T g). The
+    readout-path seed attaches at the last region's input. Returns
+    [lambda_0 .. lambda_K] (length num_regions + 1; the final entry seeds the
+    last region's update path)."""
+    if len(state_jacobians_t) != num_regions:
+        raise ValueError("state_jacobians_t length mismatch.")
+    if state_sources is not None and len(state_sources) != num_regions:
+        raise ValueError("state_sources length mismatch.")
+    if input_sources is not None and len(input_sources) != num_regions:
+        raise ValueError("input_sources length mismatch.")
+    if num_regions == 0:
+        return []
+    target_dtype = state_jacobians_t[0].dtype
+    target_device = state_jacobians_t[0].device
+
+    def _cast(t: torch.Tensor) -> torch.Tensor:
+        return t.to(device=target_device, dtype=target_dtype)
+
+    adjoints: list[torch.Tensor | None] = [None] * (num_regions + 1)
+    top = (
+        _cast(state_sources[num_regions - 1])
+        if state_sources is not None
+        else torch.zeros_like(_cast(g_last_input_state))
+    )
+    adjoints[num_regions] = top
+    for region_index in reversed(range(num_regions)):
+        lam = apply_jacobian_t(
+            state_jacobians_t[region_index],
+            adjoints[region_index + 1],
+            out_dtype=target_dtype,
+        )
+        if state_sources is not None and region_index >= 1:
+            lam = lam + _cast(state_sources[region_index - 1])
+        if input_sources is not None:
+            lam = lam + _cast(input_sources[region_index])
+        if region_index == num_regions - 1:
+            lam = lam + _cast(g_last_input_state)
+        adjoints[region_index] = lam
+    return adjoints  # type: ignore[return-value]
+
+
 def propagate_state_adjoint_by_autograd_chain(
     *,
     states: Sequence[torch.Tensor],

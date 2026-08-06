@@ -162,9 +162,31 @@ class LBITrainingConfig:
     fused_add_norm: bool = True
     include_reference_run: bool = True
     region_size: int = 2
-    message_dim: int = 64
+    message_dim: int = 2
     message_hidden_dim: int = 0
     message_scale_init: float = 0.5
+    # Interface family: "vector_mlp" = mean-pool encode + broadcast MLP decode,
+    # "attentive" = gated-pool encode + token-query slot-attention decode
+    # (the default, with strict chunks and the bounded output readout below).
+    interface_type: str = "attentive"
+    interface_attn_dim: int = 64
+    # Chunk-resolved attentive interface: >1 splits the sequence into chunks
+    # carrying one rank-`message_dim` message each (state width chunks * r).
+    # Strict mode reads only earlier chunks: a fully causal (adapted) model.
+    interface_chunks: int = 4
+    interface_chunks_strict: bool = True
+    # Per-chunk norm on the boundary state: "layer" (LayerNorm; at width 2 it
+    # is a.e. a sign function of the within-chunk difference) or "rms"
+    # (direction-preserving RMS with learned scale).
+    interface_chunk_norm: str = "layer"
+    # Canvas upgrades: direct boundary-state taps into the readout stream, a
+    # per-region diagonal canvas view, and a shared causal local-mixer conv
+    # (kernel width; 0 disables).
+    canvas_state_readout: bool = False
+    canvas_region_view: bool = False
+    canvas_local_mixer: int = 0
+    # Full-width readout accumulation (tanh-bounded gates).
+    canvas_output_readout: bool = True
     # A_k lowering: "forward" = the forward-mode construction (kernel path),
     # "native" = the reverse-mode native pullback, "graph"/"recompute" = the
     # autograd reverse constructions (oracles / fallback).
@@ -192,6 +214,9 @@ class LBITrainingConfig:
     log_interface_jacobian_every: int = 0
     log_interface_jacobian_suffix: bool = False
     eval_message_ablation: str = "none"
+    # Train-time message ablation: "zero_all" trains the ensemble control
+    # (regions read the canvas only; the readout taps stay live).
+    train_message_ablation: str = "none"
     eval_all_message_ablations: bool = False
     message_noise_std: float = 1.0
     message_mask_keep_prob: float = 0.5
@@ -285,6 +310,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--message-dim", type=int, default=64)
     p.add_argument("--message-hidden-dim", type=int, default=0)
     p.add_argument("--message-scale-init", type=float, default=0.5)
+    p.add_argument("--interface-type", type=str, default="vector_mlp", choices=["vector_mlp", "attentive"])
+    p.add_argument("--interface-attn-dim", type=int, default=64)
+    p.add_argument("--canvas-state-readout", action="store_true")
+    p.add_argument("--canvas-region-view", action="store_true")
+    p.add_argument("--canvas-local-mixer", type=int, default=0)
+    p.add_argument("--canvas-output-readout", action="store_true")
+    p.add_argument("--interface-chunks", type=int, default=1)
+    p.add_argument("--interface-chunks-strict", action="store_true")
+    p.add_argument("--interface-chunk-norm", type=str, default="layer")
     p.add_argument("--interface-jacobian-mode", type=str, default="graph")
     p.add_argument("--jacobian-basis-chunk", type=int, default=1)
     p.add_argument("--native-backward", action="store_true")
@@ -296,6 +330,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-interface-jacobian-every", type=int, default=0)
     p.add_argument("--log-interface-jacobian-suffix", action="store_true")
     p.add_argument("--eval-message-ablation", type=str, default="none")
+    p.add_argument("--train-message-ablation", type=str, default="none")
     p.add_argument("--eval-all-message-ablations", action="store_true")
     p.add_argument("--message-noise-std", type=float, default=1.0)
     p.add_argument("--message-mask-keep-prob", type=float, default=0.5)
@@ -367,6 +402,27 @@ def validate_config(cfg: LBITrainingConfig) -> None:
         raise ValueError("message_hidden_dim must be >= 0.")
     if cfg.message_scale_init <= 0.0:
         raise ValueError("message_scale_init must be > 0.")
+    if cfg.interface_type not in {"vector_mlp", "attentive"}:
+        raise ValueError("interface_type must be one of: vector_mlp, attentive")
+    if cfg.interface_attn_dim <= 0:
+        raise ValueError("interface_attn_dim must be > 0.")
+    if cfg.canvas_local_mixer < 0 or cfg.canvas_local_mixer == 1:
+        raise ValueError("canvas_local_mixer must be 0 (off) or a kernel width >= 2.")
+    if cfg.interface_chunks < 1:
+        raise ValueError("interface_chunks must be >= 1.")
+    if cfg.interface_chunks > 1:
+        if cfg.interface_type != "attentive":
+            raise ValueError("interface_chunks > 1 requires interface_type=attentive")
+        if cfg.canvas_state_readout:
+            raise ValueError("interface_chunks > 1 does not support canvas_state_readout (v1)")
+        if cfg.seq_len % cfg.interface_chunks != 0:
+            raise ValueError("interface_chunks must divide seq_len")
+    if cfg.interface_chunks_strict and cfg.interface_chunks <= 1:
+        raise ValueError("interface_chunks_strict requires interface_chunks > 1")
+    if cfg.interface_chunk_norm not in {"layer", "rms"}:
+        raise ValueError("interface_chunk_norm must be one of: layer, rms")
+    if cfg.interface_chunk_norm != "layer" and cfg.interface_chunks <= 1:
+        raise ValueError("interface_chunk_norm requires interface_chunks > 1")
     if cfg.interface_jacobian_mode not in {"graph", "recompute", "forward"}:
         raise ValueError("interface_jacobian_mode must be one of: graph, recompute, forward")
     if cfg.jacobian_basis_chunk <= 0:
@@ -377,6 +433,10 @@ def validate_config(cfg: LBITrainingConfig) -> None:
         raise ValueError("log_interface_jacobian_every must be >= 0.")
     if cfg.eval_message_ablation not in {"none", *EVAL_MESSAGE_ABLATION_MODES}:
         raise ValueError("eval_message_ablation must be one of: none, zero_all, noise, mask")
+    if cfg.train_message_ablation not in {"none", *EVAL_MESSAGE_ABLATION_MODES}:
+        raise ValueError("train_message_ablation must be one of: none, zero_all, noise, mask")
+    if cfg.train_message_ablation != "none" and cfg.lbi_backward != "autograd":
+        raise ValueError("train_message_ablation requires lbi_backward=autograd (the scan engines assume live states)")
     if cfg.message_noise_std < 0.0:
         raise ValueError("message_noise_std must be >= 0.")
     if cfg.message_mask_keep_prob <= 0.0 or cfg.message_mask_keep_prob > 1.0:
@@ -465,6 +525,15 @@ def config_from_args(args: argparse.Namespace) -> LBITrainingConfig:
         message_dim=args.message_dim,
         message_hidden_dim=args.message_hidden_dim,
         message_scale_init=args.message_scale_init,
+        interface_type=args.interface_type,
+        interface_attn_dim=args.interface_attn_dim,
+        canvas_state_readout=args.canvas_state_readout,
+        canvas_region_view=args.canvas_region_view,
+        canvas_local_mixer=args.canvas_local_mixer,
+        canvas_output_readout=args.canvas_output_readout,
+        interface_chunks=args.interface_chunks,
+        interface_chunks_strict=args.interface_chunks_strict,
+        interface_chunk_norm=args.interface_chunk_norm,
         interface_jacobian_mode=args.interface_jacobian_mode,
         jacobian_basis_chunk=args.jacobian_basis_chunk,
         native_backward=args.native_backward,
@@ -476,6 +545,7 @@ def config_from_args(args: argparse.Namespace) -> LBITrainingConfig:
         log_interface_jacobian_every=args.log_interface_jacobian_every,
         log_interface_jacobian_suffix=args.log_interface_jacobian_suffix,
         eval_message_ablation=args.eval_message_ablation,
+        train_message_ablation=args.train_message_ablation,
         eval_all_message_ablations=args.eval_all_message_ablations,
         message_noise_std=args.message_noise_std,
         message_mask_keep_prob=args.message_mask_keep_prob,

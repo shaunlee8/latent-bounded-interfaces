@@ -15,6 +15,9 @@ class InterfaceSpec:
     state_shape: tuple[int, ...]
     state_flat_dim: int
     region_condition_dim: int
+    # Token-wise interfaces decode a [B, L, D] condition (one read per token);
+    # otherwise decode yields a single [B, D] vector broadcast over the sequence.
+    condition_is_tokenwise: bool = False
 
 
 @dataclass
@@ -40,7 +43,13 @@ class InterfaceModule(nn.Module, ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def decode(self, state: torch.Tensor, region_index: int) -> torch.Tensor:
+    def decode(
+        self,
+        state: torch.Tensor,
+        region_index: int,
+        *,
+        canvas_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         raise NotImplementedError
 
     @abstractmethod

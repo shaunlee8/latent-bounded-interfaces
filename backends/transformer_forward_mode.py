@@ -162,12 +162,20 @@ def _resolve_cuda_attn_jvp():
 
 def _cache_fed_tangent_chain(backend, layer_caches, start, end, t,
                              collapse_first, compute_dtype, pooled,
-                             cuda_attn_fn=None):
+                             cuda_attn_fn=None, token_start=0):
     """The cache-fed tangent thread as one compilable function: every primal
-    operating point comes from the caches; the custom kernels trace opaque."""
+    operating point comes from the caches; the custom kernels trace opaque.
+
+    `token_start` > 0 runs the whole tangent thread on the token suffix only
+    (`t` arrives suffix-shaped [r, B, L - s, D]). Exact when the true tangent
+    is zero before `token_start`: every per-token op slices, the conv's
+    zero left-pad IS the zero tangent at the boundary, the rope tables shift
+    to absolute positions, and the flash JVP runs suffix queries against the
+    full-length cached keys/values."""
     from backbones.transformer.ops.triton.region_jvp import (
         flash_attention_jvp, fused_qkv_prep, rmsnorm_jvp)
 
+    s = int(token_start)
     dres = None
     dh = t
     for i, layer_index in enumerate(range(start, end)):
@@ -177,8 +185,8 @@ def _cache_fed_tangent_chain(backend, layer_caches, start, end, t,
         lc = layer_caches[i]
         L = lc.attention.norm_input.shape[-2]
         dres = dh + dres if dres is not None else dh
-        x_attn = lc.attention.norm_input.to(compute_dtype)
-        if i == 0 and collapse_first and attn.in_proj.bias is None:
+        x_attn = lc.attention.norm_input[:, s:].to(compute_dtype)
+        if i == 0 and collapse_first and s == 0 and attn.in_proj.bias is None:
             qkv_pre = lc.attention.qkv_preconv
             if qkv_pre is None:
                 qkv_pre = attn.in_proj(blk.norm(x_attn))
@@ -194,31 +202,34 @@ def _cache_fed_tangent_chain(backend, layer_caches, start, end, t,
         cos, sin = _rope_tables(L, hd // 2, attn.rope_base, x_attn.device)
         conv_w = attn.conv1d.weight.view(-1, attn.d_conv)
         _, _, _, dq, dk, dv = fused_qkv_prep(
-            shape_src, dqkv, synth, conv_w, attn.conv1d.bias, cos, sin,
+            shape_src, dqkv, synth, conv_w, attn.conv1d.bias,
+            cos[s:].contiguous(), sin[s:].contiguous(),
             attn.n_heads, attn.n_kv_heads, hd, emit_primal=False)
         q = lc.attention.q_rope.contiguous()
         k = lc.attention.k_rope.contiguous()
         v = lc.attention.v.contiguous()
         scale = softmax_scale(attn)
-        if cuda_attn_fn is not None and hd == 64 and L % 64 == 0:
+        if cuda_attn_fn is not None and s == 0 and hd == 64 and L % 64 == 0:
             # Flat-layout epilogue: do arrives [r, B, L, H*hd], out_proj-ready.
             _, do = cuda_attn_fn(q, k, v, dq, dk, dv, scale)
         else:
-            _, do = flash_attention_jvp(q, k, v, dq, dk, dv, scale)
+            _, do = flash_attention_jvp(q, k, v, dq, dk, dv, scale, query_start=s)
             do = do.transpose(-3, -2).flatten(-2)
         dh = _linear_tangent(attn.out_proj, do)
         dres = dh + dres
-        x_mlp = lc.mlp.norm_input.to(compute_dtype)
+        x_mlp = lc.mlp.norm_input[:, s:].to(compute_dtype)
         _, dnh = rmsnorm_jvp(x_mlp.contiguous(), dres.contiguous(),
                              blk.norm2.weight, blk.norm2.eps, emit_y=False)
         dh1 = _linear_tangent(blk.mlp.fc1, dnh)
         dup, dgate = dh1.chunk(2, dim=-1)
-        dmid = _swiglu_tangent(lc.mlp.gate, lc.mlp.up, lc.mlp.activation,
-                               dup, dgate, compute_dtype)
+        dmid = _swiglu_tangent(lc.mlp.gate[:, s:], lc.mlp.up[:, s:],
+                               lc.mlp.activation[:, s:], dup, dgate, compute_dtype)
         dh = _linear_tangent(blk.mlp.fc2, dmid)
     dout = dh + dres
     if pooled:
-        dout = dout.mean(dim=2, keepdim=True)
+        # The suffix sum over the true (zero-prefix) tangent divided by the
+        # FULL length is the exact full-sequence mean.
+        dout = dout.sum(dim=2, keepdim=True) / float(L) if s else dout.mean(dim=2, keepdim=True)
     return dout
 
 
@@ -238,10 +249,16 @@ def _kernel_path_supported(backend, start, end):
 def transformer_region_output_jvp_kernel(backend, *, cache,
                                          region_input_tangent_basis,
                                          compute_dtype=torch.bfloat16,
-                                         pooled=False):
+                                         pooled=False,
+                                         tangent_token_start=0):
     """Kernel tangent map, lane-major [r, B, L, D] internally. Falls back to
     the reference path for module configurations outside the kernel contract
-    (grouped KV heads, interleaved rope, no conv, non-power-of-two widths)."""
+    (grouped KV heads, interleaved rope, no conv, non-power-of-two widths).
+
+    `tangent_token_start` > 0: the caller certifies the tangent basis is zero
+    before that token; the cache-fed chain then computes only the suffix and
+    the result is zero-filled back to full length. Exact; ignored (full
+    compute, still exact) on the fallback and recompute paths."""
     start, end = cache.layer_range
     if not _kernel_path_supported(backend, start, end):
         out = transformer_region_output_jvp(
@@ -254,9 +271,12 @@ def transformer_region_output_jvp_kernel(backend, *, cache,
         flash_attention_jvp, fused_qkv_prep, rmsnorm_jvp)
 
     x = cache.region_input
-    t = (region_input_tangent_basis.movedim(1, 0)
-         .to(compute_dtype).contiguous())
-    collapse_first = os.environ.get("LBI_FWDMODE_BCAST", "1") != "0"
+    # The first-block collapse is exact only for an L-constant tangent basis
+    # (broadcast decodes); token-varying bases (tokenwise decodes) must take
+    # the general norm-JVP path. Detect before contiguous() expands stride-0.
+    l_const = (region_input_tangent_basis.shape[2] == 1
+               or region_input_tangent_basis.stride(2) == 0)
+    collapse_first = (os.environ.get("LBI_FWDMODE_BCAST", "1") != "0") and l_const
 
     # Cache-fed mode reads every primal operating point from the region
     # forward's caches; the recompute path below rebuilds the primal chain.
@@ -265,19 +285,33 @@ def transformer_region_output_jvp_kernel(backend, *, cache,
                  and len(layer_caches) == end - start
                  and os.environ.get("LBI_FWDMODE_CACHEPRE", "1") != "0")
 
+    s = int(tangent_token_start) if cache_fed else 0
+    full_len = region_input_tangent_basis.shape[2]
+    if s > 0 and (l_const or s >= full_len):
+        s = 0
+    basis = region_input_tangent_basis[:, :, s:] if s else region_input_tangent_basis
+    t = basis.movedim(1, 0).to(compute_dtype).contiguous()
+
     if cache_fed:
         cuda_attn_fn = _resolve_cuda_attn_jvp()
         chain = _cache_fed_tangent_chain
         if os.environ.get("LBI_FWDMODE_COMPILE", "0") != "0":
-            key = (start, end, tuple(t.shape), bool(pooled),
+            key = (start, end, tuple(t.shape), bool(pooled), s,
                    cuda_attn_fn is not None)
             chain = _COMPILED_CHAINS.get(key)
             if chain is None:
                 chain = torch.compile(_cache_fed_tangent_chain, dynamic=False)
                 _COMPILED_CHAINS[key] = chain
         dout = chain(backend, layer_caches, start, end, t, collapse_first,
-                     compute_dtype, pooled, cuda_attn_fn)
-        return dout.movedim(0, 1)
+                     compute_dtype, pooled, cuda_attn_fn, s)
+        dout = dout.movedim(0, 1)
+        if s and not pooled:
+            full = torch.zeros(
+                dout.shape[0], dout.shape[1], full_len, dout.shape[3],
+                device=dout.device, dtype=dout.dtype)
+            full[:, :, s:] = dout
+            return full
+        return dout
 
     h, dh = x.to(compute_dtype), t
     res = dres = None

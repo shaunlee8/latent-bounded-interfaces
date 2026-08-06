@@ -387,13 +387,39 @@ class TransformerRegionBackend(nn.Module):
         region_input_tangent_basis: torch.Tensor,
         compute_dtype: torch.dtype | None = None,
         pooled: bool = False,
+        output_projection: torch.Tensor | None = None,
+        output_inner: torch.Tensor | None = None,
+        tangent_token_start: int = 0,
     ) -> torch.Tensor:
         """Push a region-input tangent basis [B, P, L, D] to the region-output
         tangent basis at the frozen operating point (the dual of
         `input_pullback_basis`). `forward_mode_use_kernel` selects the fused
         kernels over the torch.func reference; `pooled` returns the mean over
-        L with keepdim; `compute_dtype=None` resolves to bf16 on the kernel
-        path (LBI_FWDMODE_CD=float32 escapes) and fp32 on the reference."""
+        L with keepdim; `output_projection`/`output_inner` return the projected
+        tangent contraction for token-wise interfaces; `compute_dtype=None`
+        resolves to bf16 on the kernel path (LBI_FWDMODE_CD=float32 escapes)
+        and fp32 on the reference.
+
+        `tangent_token_start`: caller-certified first token with nonzero
+        tangent (strict chunk-causal decodes). The cache-fed kernel chain and
+        the projection epilogue restrict compute to the suffix; other paths
+        ignore it (full compute, equally exact)."""
+        if output_projection is not None:
+            if pooled:
+                raise ValueError("pooled and output_projection are mutually exclusive")
+            from backends.tangent_projection import lane_chunked_projection
+
+            return lane_chunked_projection(
+                lambda basis: self.region_output_jvp(
+                    cache=cache, region_input_tangent_basis=basis,
+                    compute_dtype=compute_dtype,
+                    tangent_token_start=tangent_token_start,
+                ),
+                region_input_tangent_basis,
+                output_projection=output_projection,
+                output_inner=output_inner,
+                tangent_token_start=tangent_token_start,
+            )
         if getattr(self, "forward_mode_use_kernel", False):
             from backends.transformer_forward_mode import (
                 transformer_region_output_jvp_kernel,
@@ -409,6 +435,7 @@ class TransformerRegionBackend(nn.Module):
                 self,
                 cache=cache,
                 region_input_tangent_basis=region_input_tangent_basis,
+                tangent_token_start=tangent_token_start,
                 compute_dtype=compute_dtype,
                 pooled=pooled,
             )
@@ -428,6 +455,9 @@ class TorchAutogradTransformerLowering:
 
     name = "torch_autograd"
 
+    # Builds a local graph; callers (structured-pullback providers) may run
+    # under no_grad.
+    @torch.enable_grad()
     def input_pullback_basis(
         self,
         *,

@@ -47,10 +47,30 @@ from models.lbi_language_model import LBILanguageModel
 
 
 def build_model(a, dev):
-    interface = VectorMLPInterface(
-        feature_dim=a.dim, num_regions=a.regions, interface_width=a.rank,
-        interface_map_hidden_dim=a.dim, update_scale_init=0.5,
-    )
+    interface_kind = getattr(a, "interface", "vector_mlp")
+    if interface_kind == "chunked":
+        from interfaces import ChunkedAttentiveInterface
+
+        chunks = int(getattr(a, "interface_chunks", 4))
+        if a.rank % chunks != 0:
+            raise ValueError("chunked interface requires rank divisible by chunks")
+        interface = ChunkedAttentiveInterface(
+            feature_dim=a.dim, num_regions=a.regions, chunk_count=chunks,
+            chunk_width=a.rank // chunks, attn_dim=64, update_scale_init=0.5,
+            strict_causal=not bool(getattr(a, "interface_inclusive", False)),
+        )
+    elif interface_kind == "attentive":
+        from interfaces import AttentiveInterface
+
+        interface = AttentiveInterface(
+            feature_dim=a.dim, num_regions=a.regions, interface_width=a.rank,
+            attn_dim=64, update_scale_init=0.5,
+        )
+    else:
+        interface = VectorMLPInterface(
+            feature_dim=a.dim, num_regions=a.regions, interface_width=a.rank,
+            interface_map_hidden_dim=a.dim, update_scale_init=0.5,
+        )
     if a.backbone == "transformer":
         spec = BackboneSpec(
             name="transformer", dim=a.dim, layers=a.regions * a.layers_per_region,
@@ -63,6 +83,10 @@ def build_model(a, dev):
         )
     model = LBILanguageModel(
         vocab_size=a.vocab, layers_per_region=a.layers_per_region, backbone_spec=spec, interface=interface,
+        canvas_local_mixer=int(getattr(a, "canvas_local_mixer", 0)),
+        canvas_region_view=bool(getattr(a, "canvas_region_view", False)),
+        canvas_state_readout=bool(getattr(a, "canvas_state_readout", False)),
+        canvas_output_readout=bool(getattr(a, "canvas_output_readout", False)),
     ).to(device=dev, dtype=torch.bfloat16)
     if a.lowering == "autograd" and a.backbone == "mamba3":
         from backends import RegionLocalAutogradMamba3Lowering
@@ -173,14 +197,21 @@ def _time_barrier(fn, dev, warmup, iters):
 
 
 def _worst_rel(grad_map, ref_map, dev):
-    """Worst relative gradient error vs a reference map, maxed across ranks."""
+    """Worst relative gradient error vs a reference map, maxed across ranks.
+    LBI_PARITY_DEBUG=1 prints each rank's worst offenders."""
     worst = 0.0
+    offenders = []
     for n, g in grad_map.items():
         r = ref_map.get(n)
         if g is None or r is None:
             continue
-        rel = (g.float() - r.float()).abs().max() / (r.float().abs().max() + 1e-9)
+        rel = float((g.float() - r.float()).abs().max() / (r.float().abs().max() + 1e-9))
+        offenders.append((rel, n))
         worst = max(worst, float(rel))
+    if os.environ.get("LBI_PARITY_DEBUG"):
+        offenders.sort(reverse=True)
+        for rel, n in offenders[:8]:
+            print(f"[parity rank={dist.get_rank()}] {rel:.4f} {n}", flush=True)
     worst_t = torch.tensor([worst], device=dev)
     dist.all_reduce(worst_t, op=dist.ReduceOp.MAX)
     return float(worst_t.item())

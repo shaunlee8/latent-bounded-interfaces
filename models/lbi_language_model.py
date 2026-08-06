@@ -16,7 +16,7 @@ from backends import (
 )
 from canvas import TokenEmbeddingCanvas
 from interfaces import InterfaceModule, InterfaceStep
-from readouts import NormLMHeadReadout
+from readouts import NormLMHeadReadout, StateReadout
 
 
 _VALID_STATE_ABLATIONS = {"none", "zero_all", "noise", "mask"}
@@ -71,6 +71,11 @@ class LBILanguageModel(nn.Module):
         backbone_spec: BackboneSpec,
         interface: InterfaceModule,
         tie_embeddings: bool = False,
+        canvas_local_mixer: int = 0,
+        canvas_region_view: bool = False,
+        canvas_state_readout: bool = False,
+        canvas_output_readout: bool = False,
+        state_readout_attn_dim: int = 64,
     ) -> None:
         super().__init__()
         backbone_spec.validate()
@@ -87,7 +92,20 @@ class LBILanguageModel(nn.Module):
         self.num_regions = len(self.region_ranges)
         interface.validate_region_count(self.num_regions)
 
-        self.canvas = TokenEmbeddingCanvas(vocab_size=vocab_size, feature_dim=self.hidden_dim)
+        self.canvas = TokenEmbeddingCanvas(
+            vocab_size=vocab_size, feature_dim=self.hidden_dim, local_mixer_kernel=canvas_local_mixer
+        )
+        # Per-region diagonal view of the shared canvas (identity at init).
+        if canvas_region_view:
+            self.canvas_view_gain = nn.ParameterList(
+                [nn.Parameter(torch.zeros(self.hidden_dim)) for _ in range(self.num_regions)]
+            )
+            self.canvas_view_bias = nn.ParameterList(
+                [nn.Parameter(torch.zeros(self.hidden_dim)) for _ in range(self.num_regions)]
+            )
+        else:
+            self.canvas_view_gain = None
+            self.canvas_view_bias = None
         if backbone_spec.name == "transformer":
             self.region_backend = TransformerRegionBackend(backbone_spec=backbone_spec, region_ranges=self.region_ranges)
         elif backbone_spec.name == "mamba3":
@@ -101,6 +119,22 @@ class LBILanguageModel(nn.Module):
             tie_embeddings=self.tie_embeddings,
         )
         self.interface = interface
+        if canvas_state_readout:
+            self.state_readout = StateReadout(
+                num_regions=self.num_regions,
+                state_width=interface.spec.state_flat_dim,
+                feature_dim=self.hidden_dim,
+                tokenwise=bool(getattr(interface.spec, "condition_is_tokenwise", False)),
+                attn_dim=state_readout_attn_dim,
+            )
+        else:
+            self.state_readout = None
+        # Full-width readout accumulation: every region's output enters the
+        # readout stream through a zero-init gate (autograd engines only).
+        if canvas_output_readout:
+            self.output_readout_gates = nn.Parameter(torch.zeros(self.num_regions))
+        else:
+            self.output_readout_gates = None
 
         if backbone_spec.name in {"transformer", "hybrid"}:
             init_transformer_module(self.canvas, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
@@ -111,7 +145,27 @@ class LBILanguageModel(nn.Module):
 
     def output_head_vjp_parameters(self) -> list[nn.Parameter]:
         """Readout parameters touched by loss-to-output local VJPs."""
-        return self.readout.vjp_parameters()
+        params = list(self.readout.vjp_parameters())
+        if self.state_readout is not None:
+            params.extend(p for p in self.state_readout.parameters() if p.requires_grad)
+        if self.output_readout_gates is not None and self.output_readout_gates.requires_grad:
+            params.append(self.output_readout_gates)
+        return params
+
+    def region_view_parameters(self, region_index: int) -> list[nn.Parameter]:
+        """Per-region canvas-view parameters touched by that region's local VJP."""
+        if self.canvas_view_gain is None:
+            return []
+        return [self.canvas_view_gain[region_index], self.canvas_view_bias[region_index]]
+
+    def viewed_canvas(self, canvas_features: torch.Tensor, region_index: int) -> torch.Tensor:
+        """The canvas as region `region_index` reads it (identity when the
+        per-region view is disabled)."""
+        if self.canvas_view_gain is None:
+            return canvas_features
+        gain = self.canvas_view_gain[region_index].to(dtype=canvas_features.dtype)
+        bias = self.canvas_view_bias[region_index].to(dtype=canvas_features.dtype)
+        return canvas_features * (1.0 + gain) + bias
 
     def canvas_vjp_parameters(self) -> list[nn.Parameter]:
         """Canvas parameters touched by local VJPs."""
@@ -162,6 +216,7 @@ class LBILanguageModel(nn.Module):
         ablation_generator: torch.Generator | None = None,
         native_backward: bool = False,
         trim_region_cache: bool = False,
+        detach_state_taps: bool | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # native_backward runs the region body under no_grad (the native scan
         # backward rebuilds region grads from the frozen backend caches);
@@ -194,8 +249,9 @@ class LBILanguageModel(nn.Module):
         for region_index, (start, end) in enumerate(self.region_ranges):
             state_in = state
             with region_ctx:
-                condition = self.interface.decode(state_in, region_index)
-                region_input = canvas_features + condition.unsqueeze(1)
+                condition = self.interface.decode(state_in, region_index, canvas_features=canvas_features)
+                canvas_read = self.viewed_canvas(canvas_features, region_index)
+                region_input = canvas_read + (condition if condition.dim() == 3 else condition.unsqueeze(1))
                 region_output, backend_cache = self.region_backend.forward_region(
                     region_input=region_input,
                     region_index=region_index,
@@ -236,7 +292,32 @@ class LBILanguageModel(nn.Module):
         if native_backward:
             readout_input = readout_input.detach().requires_grad_(True)
             region_caches[-1].region_output = readout_input
-        logits = self.readout(readout_input, canvas=self.canvas)
+        # Boundary-state taps into the readout stream. The scan engines need the
+        # taps severed from the state chain (their direct cotangents become the
+        # scan's source terms); the plain autograd engine needs them attached.
+        detach_taps = native_backward if detach_state_taps is None else bool(detach_state_taps)
+        readout_stream = readout_input
+        state_taps: list[torch.Tensor] = []
+        state_readout_terms: list[torch.Tensor] = []
+        if self.state_readout is not None:
+            for state_out in states[1:]:
+                tap = state_out.detach().requires_grad_(True) if detach_taps else state_out
+                state_taps.append(tap)
+            state_readout_terms = self.state_readout.contributions(state_taps, canvas_features)
+            for term in state_readout_terms:
+                readout_stream = readout_stream + (term if term.dim() == 3 else term.unsqueeze(1))
+        output_taps: list[torch.Tensor] = []
+        if self.output_readout_gates is not None:
+            # Gates are tanh-bounded: signed mixtures stay expressive (learned
+            # values sit well inside +-1) while runaway amplification cannot.
+            # Scan engines take severed output taps (their direct cotangents
+            # become the scan's input-side source terms), mirroring state taps.
+            for k, region_output in enumerate(region_outputs):
+                tap = region_output.detach().requires_grad_(True) if detach_taps else region_output
+                output_taps.append(tap)
+                gate = torch.tanh(self.output_readout_gates[k]).to(dtype=tap.dtype)
+                readout_stream = readout_stream + gate * tap
+        logits = self.readout(readout_stream, canvas=self.canvas)
         cache = LBICache(
             canvas_features=canvas_features,
             states=states,
@@ -252,6 +333,9 @@ class LBILanguageModel(nn.Module):
             "region_outputs": cache.region_outputs,
             "region_ranges": cache.region_ranges,
             "region_caches": cache.region_caches,
+            "state_taps": state_taps,
+            "state_readout_terms": state_readout_terms,
+            "output_taps": output_taps,
         }
 
 

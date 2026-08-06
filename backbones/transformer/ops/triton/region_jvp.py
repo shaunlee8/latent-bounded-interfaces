@@ -16,14 +16,16 @@ import triton.language as tl
 
 @triton.jit
 def _attention_lane_step(q, k, v, p, pb, causal, alpha, acc_do, acc_s,
-                         DQp, DKp, DVp, base, rm, rn, rd, Lctx,
+                         DQp, DKp, DVp, base_d, rm_rel, rn, rd, QS, DL,
                          SCALE: tl.constexpr, HD: tl.constexpr):
-    dq = tl.load(DQp + base + rm[:, None] * HD + rd[None, :],
-                 mask=rm[:, None] < Lctx, other=0.0)
-    dk = tl.load(DKp + base + rn[:, None] * HD + rd[None, :],
-                 mask=rn[:, None] < Lctx, other=0.0)
-    dv = tl.load(DVp + base + rn[:, None] * HD + rd[None, :],
-                 mask=rn[:, None] < Lctx, other=0.0)
+    dq = tl.load(DQp + base_d + rm_rel[:, None] * HD + rd[None, :],
+                 mask=rm_rel[:, None] < DL, other=0.0)
+    rn_rel = rn - QS
+    dkv_mask = (rn_rel[:, None] >= 0) & (rn_rel[:, None] < DL)
+    dk = tl.load(DKp + base_d + rn_rel[:, None] * HD + rd[None, :],
+                 mask=dkv_mask, other=0.0)
+    dv = tl.load(DVp + base_d + rn_rel[:, None] * HD + rd[None, :],
+                 mask=dkv_mask, other=0.0)
     ds = (tl.dot(dq, tl.trans(k)) + tl.dot(q, tl.trans(dk))) * SCALE
     ds = tl.where(causal, ds, 0.0)
     pds = p * ds
@@ -34,21 +36,28 @@ def _attention_lane_step(q, k, v, p, pb, causal, alpha, acc_do, acc_s,
 
 @triton.jit
 def _flash_attention_jvp(Qp, Kp, Vp, DQp, DKp, DVp, Op, DOp,
-                         Lctx, lane_str,
+                         Lctx, DL, QS, lane_str,
                          SCALE: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
                          HD: tl.constexpr, R: tl.constexpr):
     """Causal flash attention with R tangent lanes riding one KV pass.
 
     dO = (sum(p*dS) V + sum(p) dV - rowsum(p*dS) * O) / l with the online
     rescale corrections; softmax shift invariance keeps the running-max term
-    exact. Per-lane accumulators are unrolled (R is constexpr, R <= 4)."""
+    exact. Per-lane accumulators are unrolled (R is constexpr, R <= 4).
+
+    QS/DL: query-suffix mode. Q/K/V are full-length [.., Lctx, HD]; the
+    tangents and outputs cover only the DL = Lctx - QS suffix rows (exact when
+    the tangent stream is zero before QS — the strict chunk-causal decode).
+    QS = 0, DL = Lctx is the square causal case."""
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
     base = pid_bh.to(tl.int64) * Lctx * HD
-    rm = pid_m * BM + tl.arange(0, BM)
+    base_d = pid_bh.to(tl.int64) * DL * HD
+    rm_rel = pid_m * BM + tl.arange(0, BM)
+    rm = QS + rm_rel
     rd = tl.arange(0, HD)
     q = tl.load(Qp + base + rm[:, None] * HD + rd[None, :],
-                mask=rm[:, None] < Lctx, other=0.0)
+                mask=rm_rel[:, None] < DL, other=0.0)
 
     m_i = tl.full([BM], float("-inf"), tl.float32)
     l_i = tl.zeros([BM], tl.float32)
@@ -62,7 +71,7 @@ def _flash_attention_jvp(Qp, Kp, Vp, DQp, DKp, DVp, Op, DOp,
     do3 = tl.zeros([BM, HD], tl.float32)
     s3 = tl.zeros([BM], tl.float32)
 
-    hi = (pid_m + 1) * BM
+    hi = QS + (pid_m + 1) * BM
     for start in range(0, hi, BN):
         rn = start + tl.arange(0, BN)
         kv_mask = rn[:, None] < Lctx
@@ -79,59 +88,66 @@ def _flash_attention_jvp(Qp, Kp, Vp, DQp, DKp, DVp, Op, DOp,
         acc = acc * alpha[:, None] + tl.dot(pb, v)
         do0, s0 = _attention_lane_step(q, k, v, p, pb, causal, alpha, do0, s0,
                                        DQp + 0 * lane_str, DKp + 0 * lane_str,
-                                       DVp + 0 * lane_str, base, rm, rn, rd,
-                                       Lctx, SCALE, HD)
+                                       DVp + 0 * lane_str, base_d, rm_rel, rn, rd,
+                                       QS, DL, SCALE, HD)
         if R >= 2:
             do1, s1 = _attention_lane_step(q, k, v, p, pb, causal, alpha, do1, s1,
                                            DQp + 1 * lane_str, DKp + 1 * lane_str,
-                                           DVp + 1 * lane_str, base, rm, rn, rd,
-                                           Lctx, SCALE, HD)
+                                           DVp + 1 * lane_str, base_d, rm_rel, rn, rd,
+                                           QS, DL, SCALE, HD)
         if R >= 3:
             do2, s2 = _attention_lane_step(q, k, v, p, pb, causal, alpha, do2, s2,
                                            DQp + 2 * lane_str, DKp + 2 * lane_str,
-                                           DVp + 2 * lane_str, base, rm, rn, rd,
-                                           Lctx, SCALE, HD)
+                                           DVp + 2 * lane_str, base_d, rm_rel, rn, rd,
+                                           QS, DL, SCALE, HD)
         if R >= 4:
             do3, s3 = _attention_lane_step(q, k, v, p, pb, causal, alpha, do3, s3,
                                            DQp + 3 * lane_str, DKp + 3 * lane_str,
-                                           DVp + 3 * lane_str, base, rm, rn, rd,
-                                           Lctx, SCALE, HD)
+                                           DVp + 3 * lane_str, base_d, rm_rel, rn, rd,
+                                           QS, DL, SCALE, HD)
         m_i = m_new
 
     o = acc / l_i[:, None]
-    st_mask = rm[:, None] < Lctx
-    tl.store(Op + base + rm[:, None] * HD + rd[None, :], o.to(tl.bfloat16), mask=st_mask)
-    tl.store(DOp + 0 * lane_str + base + rm[:, None] * HD + rd[None, :],
+    st_mask = rm_rel[:, None] < DL
+    tl.store(Op + base_d + rm_rel[:, None] * HD + rd[None, :], o.to(tl.bfloat16), mask=st_mask)
+    tl.store(DOp + 0 * lane_str + base_d + rm_rel[:, None] * HD + rd[None, :],
              ((do0 - s0[:, None] * o) / l_i[:, None]).to(tl.bfloat16), mask=st_mask)
     if R >= 2:
-        tl.store(DOp + 1 * lane_str + base + rm[:, None] * HD + rd[None, :],
+        tl.store(DOp + 1 * lane_str + base_d + rm_rel[:, None] * HD + rd[None, :],
                  ((do1 - s1[:, None] * o) / l_i[:, None]).to(tl.bfloat16), mask=st_mask)
     if R >= 3:
-        tl.store(DOp + 2 * lane_str + base + rm[:, None] * HD + rd[None, :],
+        tl.store(DOp + 2 * lane_str + base_d + rm_rel[:, None] * HD + rd[None, :],
                  ((do2 - s2[:, None] * o) / l_i[:, None]).to(tl.bfloat16), mask=st_mask)
     if R >= 4:
-        tl.store(DOp + 3 * lane_str + base + rm[:, None] * HD + rd[None, :],
+        tl.store(DOp + 3 * lane_str + base_d + rm_rel[:, None] * HD + rd[None, :],
                  ((do3 - s3[:, None] * o) / l_i[:, None]).to(tl.bfloat16), mask=st_mask)
 
 
-def flash_attention_jvp(q, k, v, dq, dk, dv, scale):
-    """q/k/v [B,H,L,hd] bf16 contiguous; dq/dk/dv [r,B,H,L,hd]; returns
-    (o [B,H,L,hd], do [r,B,H,L,hd]). Lanes run as pairs, the primal is
-    recomputed per pair with identical results; config is keyed on (hd, L)."""
+def flash_attention_jvp(q, k, v, dq, dk, dv, scale, query_start=0):
+    """q/k/v [B,H,L,hd] bf16 contiguous; dq/dk/dv [r,B,H,DL,hd] with
+    DL = L - query_start; returns (o [B,H,DL,hd], do [r,B,H,DL,hd]). With
+    query_start > 0 only the suffix query rows are computed against the
+    full-length keys/values — exact when the tangent stream is zero before
+    query_start. Lanes run as pairs, the primal is recomputed per pair with
+    identical results; config is keyed on (hd, L)."""
     B, H, L, HD = q.shape
+    qs = int(query_start)
+    DL = L - qs
     r = dq.shape[0]
+    if dq.shape[3] != DL:
+        raise ValueError("tangent length must equal L - query_start")
     if L >= 4096 and HD <= 64:
         BM, BN, warps, stages = 128, 64, 8, 3
     else:
         BM, BN, warps, stages = 64, 64, 4, 2
-    o = torch.empty_like(q)
+    o = torch.empty(B, H, DL, HD, device=q.device, dtype=q.dtype)
     do = torch.empty_like(dq)
-    grid = (triton.cdiv(L, BM), B * H)
+    grid = (triton.cdiv(DL, BM), B * H)
     for j in range(0, r, 2):
         rt = min(2, r - j)
-        doj = torch.empty(rt, B, H, L, HD, device=q.device, dtype=q.dtype)
+        doj = torch.empty(rt, B, H, DL, HD, device=q.device, dtype=q.dtype)
         _flash_attention_jvp[grid](q, k, v, dq[j:], dk[j:], dv[j:], o, doj,
-                                   L, dq.stride(0),
+                                   L, DL, qs, dq.stride(0),
                                    SCALE=scale, BM=BM, BN=BN, HD=HD, R=rt,
                                    num_warps=warps, num_stages=stages)
         do[j:j + rt] = doj

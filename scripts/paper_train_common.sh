@@ -45,9 +45,20 @@ VOCAB_SIZE="${VOCAB_SIZE:-32000}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-}"
 if [[ "${VARIANT}" == "lbi" ]]; then
   REGION_SIZE="${REGION_SIZE:-2}"
-  MESSAGE_DIM="${MESSAGE_DIM:-64}"
+  # Defaults: guarded attentive interface, strict causal chunks
+  # (MESSAGE_DIM per chunk), tanh-bounded output readout.
+  MESSAGE_DIM="${MESSAGE_DIM:-2}"
   MESSAGE_HIDDEN_DIM="${MESSAGE_HIDDEN_DIM:-0}"
   MESSAGE_SCALE_INIT="${MESSAGE_SCALE_INIT:-0.5}"
+  INTERFACE_TYPE="${INTERFACE_TYPE:-attentive}"
+  INTERFACE_ATTN_DIM="${INTERFACE_ATTN_DIM:-64}"
+  CANVAS_STATE_READOUT="${CANVAS_STATE_READOUT:-false}"
+  CANVAS_REGION_VIEW="${CANVAS_REGION_VIEW:-false}"
+  CANVAS_LOCAL_MIXER="${CANVAS_LOCAL_MIXER:-0}"
+  CANVAS_OUTPUT_READOUT="${CANVAS_OUTPUT_READOUT:-true}"
+  INTERFACE_CHUNKS="${INTERFACE_CHUNKS:-4}"
+  INTERFACE_CHUNKS_STRICT="${INTERFACE_CHUNKS_STRICT:-true}"
+  INTERFACE_CHUNK_NORM="${INTERFACE_CHUNK_NORM:-layer}"
 fi
 if [[ -z "${LR_MODEL+x}" ]]; then
   case "${MODEL_SCALE}:${BACKBONE}" in
@@ -55,7 +66,8 @@ if [[ -z "${LR_MODEL+x}" ]]; then
       LR_MODEL="8e-4"
       ;;
     canonical:mamba3)
-      if [[ "${VARIANT}" == "lbi" ]]; then LR_MODEL="3e-4"; else LR_MODEL="6e-4"; fi
+      # Swept operating point for the guarded attentive interface.
+      LR_MODEL="6e-4"
       ;;
     canonical:hybrid)
       if [[ "${VARIANT}" == "lbi" && ( "${MESSAGE_DIM}" == "32" || "${MESSAGE_DIM}" == "64" ) ]]; then
@@ -99,10 +111,12 @@ if [[ -z "${WEIGHT_DECAY+x}" ]]; then
 fi
 GRAD_CLIP="${GRAD_CLIP:-1.0}"
 if [[ "${VARIANT}" == "lbi" ]]; then
-  INTERFACE_JACOBIAN_MODE="${INTERFACE_JACOBIAN_MODE:-recompute}"
+  # Forward-mode kernel construction + native local VJPs: the fastest
+  # exact engine at training scale.
+  INTERFACE_JACOBIAN_MODE="${INTERFACE_JACOBIAN_MODE:-forward}"
   JACOBIAN_BASIS_CHUNK="${JACOBIAN_BASIS_CHUNK:-32}"
   LBI_BACKWARD="${LBI_BACKWARD:-scan}"
-  NATIVE_BACKWARD="${NATIVE_BACKWARD:-false}"
+  NATIVE_BACKWARD="${NATIVE_BACKWARD:-true}"
   COMPILE_TURN="${COMPILE_TURN:-false}"
 else
   COMPILE_DENSE="${COMPILE_DENSE:-false}"
@@ -236,10 +250,27 @@ if [[ "${VARIANT}" == "lbi" ]]; then
     --message-dim "${MESSAGE_DIM}"
     --message-hidden-dim "${MESSAGE_HIDDEN_DIM}"
     --message-scale-init "${MESSAGE_SCALE_INIT}"
+    --interface-type "${INTERFACE_TYPE}"
+    --interface-attn-dim "${INTERFACE_ATTN_DIM}"
     --interface-jacobian-mode "${INTERFACE_JACOBIAN_MODE}"
     --jacobian-basis-chunk "${JACOBIAN_BASIS_CHUNK}"
     --lbi-backward "${LBI_BACKWARD}"
   )
+  COMMON_ARGS+=(--canvas-local-mixer "${CANVAS_LOCAL_MIXER}")
+  COMMON_ARGS+=(--interface-chunks "${INTERFACE_CHUNKS}")
+  COMMON_ARGS+=(--interface-chunk-norm "${INTERFACE_CHUNK_NORM}")
+  if [[ "${INTERFACE_CHUNKS_STRICT}" == "true" || "${INTERFACE_CHUNKS_STRICT}" == "1" ]]; then
+    COMMON_ARGS+=(--interface-chunks-strict)
+  fi
+  if [[ "${CANVAS_OUTPUT_READOUT}" == "true" || "${CANVAS_OUTPUT_READOUT}" == "1" ]]; then
+    COMMON_ARGS+=(--canvas-output-readout)
+  fi
+  if [[ "${CANVAS_STATE_READOUT}" == "true" || "${CANVAS_STATE_READOUT}" == "1" ]]; then
+    COMMON_ARGS+=(--canvas-state-readout)
+  fi
+  if [[ "${CANVAS_REGION_VIEW}" == "true" || "${CANVAS_REGION_VIEW}" == "1" ]]; then
+    COMMON_ARGS+=(--canvas-region-view)
+  fi
   if [[ "${NATIVE_BACKWARD}" == "true" || "${NATIVE_BACKWARD}" == "1" ]]; then
     COMMON_ARGS+=(--native-backward)
   fi
@@ -409,6 +440,8 @@ echo "Requested vocab size: ${VOCAB_SIZE}"
 if [[ "${VARIANT}" == "lbi" ]]; then
   echo "Region size: ${REGION_SIZE}"
   echo "Message dim: ${MESSAGE_DIM}"
+  echo "Interface type: ${INTERFACE_TYPE}"
+  echo "Canvas: state_readout=${CANVAS_STATE_READOUT} region_view=${CANVAS_REGION_VIEW} local_mixer=${CANVAS_LOCAL_MIXER}"
   echo "Interface Jacobian mode: ${INTERFACE_JACOBIAN_MODE}"
   echo "Jacobian basis chunk: ${JACOBIAN_BASIS_CHUNK}"
   echo "LBI backward: ${LBI_BACKWARD}"

@@ -211,6 +211,9 @@ class Mamba3RegionBackend(nn.Module):
         region_input_tangent_basis: torch.Tensor,
         compute_dtype: "torch.dtype | None" = None,
         pooled: bool = False,
+        output_projection: "torch.Tensor | None" = None,
+        output_inner: "torch.Tensor | None" = None,
+        tangent_token_start: int = 0,
     ) -> torch.Tensor:
         """Forward-mode region map: push a region-input tangent basis [B, P, L, D]
         to a region-output tangent basis [B, P, L, D] at the frozen operating
@@ -223,9 +226,35 @@ class Mamba3RegionBackend(nn.Module):
         for the A_k path, whose only consumer is the interface meanpool; the
         kernel path folds the last block's finalize + meanpool on-chip.
 
+        `output_projection` [Rp, D] (with optional `output_inner` [B, L, D]):
+        return the projected tangent contraction instead of the full basis —
+        the token-weighted pooling form consumed by token-wise interfaces.
+
         `compute_dtype=None` resolves per path: bf16 tangent stream on the
         kernel path (LBI_FWDMODE_CD=float32 escapes), fp32 on the reference
-        path."""
+        path.
+
+        `tangent_token_start`: caller-certified first token with nonzero
+        tangent. The kernel path routes the scan through the pass kernels —
+        full-length primal pass A + tri pass B, tangent passes on the suffix
+        chunks only — and the projection epilogue contracts the suffix only;
+        paths that cannot restrict ignore it (full compute, equally exact)."""
+        if output_projection is not None:
+            if pooled:
+                raise ValueError("pooled and output_projection are mutually exclusive")
+            from backends.tangent_projection import lane_chunked_projection
+
+            return lane_chunked_projection(
+                lambda basis: self.region_output_jvp(
+                    cache=cache, region_input_tangent_basis=basis,
+                    compute_dtype=compute_dtype,
+                    tangent_token_start=tangent_token_start,
+                ),
+                region_input_tangent_basis,
+                output_projection=output_projection,
+                output_inner=output_inner,
+                tangent_token_start=tangent_token_start,
+            )
         if getattr(self, "forward_mode_use_kernel", False):
             from backends.mamba3_forward_mode import mamba3_region_output_jvp_kernel
 
@@ -240,6 +269,7 @@ class Mamba3RegionBackend(nn.Module):
                 region_input_tangent_basis=region_input_tangent_basis,
                 compute_dtype=compute_dtype,
                 pooled=pooled,
+                tangent_token_start=tangent_token_start,
             )
         from backends.mamba3_forward_mode import mamba3_region_output_jvp
 
@@ -277,6 +307,9 @@ class TorchAutogradMamba3Lowering:
 
     name = "torch_autograd"
 
+    # Builds a local graph; callers (structured-pullback providers) may run
+    # under no_grad.
+    @torch.enable_grad()
     def input_pullback_basis(
         self,
         *,

@@ -743,6 +743,7 @@ def mamba3_mixer_jvp_kernel(
     proj_cached: "torch.Tensor | None" = None,
     xn_cached: "torch.Tensor | None" = None,
     fwd_caps: "tuple | None" = None,
+    token_start: int = 0,
 ) -> "tuple[torch.Tensor, list[torch.Tensor]]":
     """Kernel-backed SISO mixer forward+JVP over r lanes: explicit preprocess
     and linear postprocess around the fused scan kernel, which returns the
@@ -753,7 +754,13 @@ def mamba3_mixer_jvp_kernel(
     Broadcast fast path: pass `bcast_norm` (the block RMSNorm) and `du_bcast`
     [r, B, D] with `u` = the pre-norm block input and `du_lanes=None`; for
     L-broadcast tangents the norm-JVP + tangent projection collapse exactly
-    (see `_mixer_preprocess_bcast_fwd_jvp`)."""
+    (see `_mixer_preprocess_bcast_fwd_jvp`).
+
+    `token_start` > 0 (caller-certified zero tangent before it, suffix-shaped
+    `du_lanes` [r, B, L - s, D], gen path + cached preprocess only): the scan
+    routes through the pass kernels — full-length primal pass A + tri pass B,
+    tangent passes on the suffix chunks only — and returns suffix-shaped
+    outputs [B, L - s, D] / [r, B, L - s, D]."""
     import os
     from backbones.mamba3.ops.tilelang.mamba3.mamba3_siso_dualscan import (
         mamba3_siso_dualscan_tilelang_rwide,
@@ -776,6 +783,7 @@ def mamba3_mixer_jvp_kernel(
 
     # explicit batched preprocess forward+JVP, compiled as three separate
     # units (a single fused region is slower).
+    s_tok = 0
     if du_bcast is not None:
         # broadcast fast path: fused norm-JVP + L-collapsed projection
         # (exact rank-2-in-L); the [B,r,L,D] basis is never materialized.
@@ -794,6 +802,11 @@ def mamba3_mixer_jvp_kernel(
         # list -> stack copy at every inter-block boundary).
         du_stack = (du_lanes.to(compute_dtype) if torch.is_tensor(du_lanes)
                     else torch.stack([d.to(compute_dtype) for d in du_lanes], dim=0))
+        s_tok = int(token_start)
+        if s_tok > 0:  # suffix contract: du_lanes arrive [r, B, L - s, D]
+            # Zero-pad to full length so the elementwise preprocess stays
+            # shape-aligned with the primal; the scan passes restrict below.
+            du_stack = F.pad(du_stack, (0, 0, s_tok, 0))
         r = du_stack.shape[0]
         if proj_cached is not None:
             scan_inputs, tb = _maybe_compile(
@@ -839,6 +852,58 @@ def mamba3_mixer_jvp_kernel(
         N = QR.shape[-1]
         P = Vv.shape[-1]
         Da = COS.shape[-1]
+        if s_tok > 0 and Sp == S and s_tok % cs == 0 and s_tok < S:
+            # Suffix scan via the pass kernels: primal pass A + tri pass B run
+            # full-length; the r-lane tangent passes cover the suffix plus one
+            # halo chunk (the trapezoidal fields read one token ahead).
+            from backbones.mamba3.ops.tilelang.mamba3.mamba3_siso_dualscan import (
+                _get_p1_kernels, _pass_b_tri_lanes)
+
+            s_h = s_tok - cs
+            S_tan = S - s_h
+            S_suf = S - s_tok
+            nc, nc_tan, nc_suf = Sp // cs, S_tan // cs, S_suf // cs
+            kpa = _get_p1_kernels(B, Sp, H, G, N, Da, P, cs, r, S, dtype="bfloat16")[0]
+            kpat_t = _get_p1_kernels(
+                B, S_tan, H, G, N, Da, P, cs, r, S_tan, dtype="bfloat16")[1]
+            kpc_s = _get_p1_kernels(
+                B, S_suf, H, G, N, Da, P, cs, r, S_suf, dtype="bfloat16")[2]
+            SC = kpa(KR, Vv, SCALE, L_bhs)
+            KR_h, Vv_h = KR[:, s_h:].contiguous(), Vv[:, s_h:].contiguous()
+            COS_h, SIN_h = COS[:, :, s_h:].contiguous(), SIN[:, :, s_h:].contiguous()
+            SCALE_h, L_h = SCALE[:, :, s_h:].contiguous(), L_bhs[:, :, s_h:].contiguous()
+            DKRAW_h, DV_h = DKRAW[:, :, s_h:].contiguous(), DV[:, :, s_h:].contiguous()
+            DTHETA_h = DTHETA[:, :, :, s_h:].contiguous()
+            DSCALE_h = DSCALE[:, :, :, s_h:].contiguous()
+            DL_h = DL[:, :, :, s_h:].contiguous()
+            DSC_t = kpat_t(KR_h, Vv_h, DKRAW_h, DV_h, DTHETA_h, COS_h, SIN_h,
+                           SCALE_h, DSCALE_h, L_h, DL_h)
+            DSC = torch.zeros(r, B, H, nc, N, P, device=SC.device, dtype=DSC_t.dtype)
+            DSC[:, :, :, nc - nc_tan:] = DSC_t
+            S_IN, DS_IN = _pass_b_tri_lanes(SC, DSC, L_bhs, DL, cs)
+            QR_s, KR_s, Vv_s = (t[:, s_tok:].contiguous() for t in (QR, KR, Vv))
+            COS_s, SIN_s = COS[:, :, s_tok:].contiguous(), SIN[:, :, s_tok:].contiguous()
+            SCALE_s, L_s = SCALE[:, :, s_tok:].contiguous(), L_bhs[:, :, s_tok:].contiguous()
+            DQRAW_s, DKRAW_s, DV_s = (t[:, :, s_tok:].contiguous() for t in (DQRAW, DKRAW, DV))
+            DTHETA_s = DTHETA[:, :, :, s_tok:].contiguous()
+            DSCALE_s = DSCALE[:, :, :, s_tok:].contiguous()
+            DL_s = DL[:, :, :, s_tok:].contiguous()
+            OUT_s, DOUT_s = kpc_s(QR_s, KR_s, Vv_s, DQRAW_s, DKRAW_s, DV_s,
+                                  DTHETA_s, COS_s, SIN_s, SCALE_s, DSCALE_s,
+                                  L_s, DL_s,
+                                  S_IN[:, :, nc - nc_suf:].contiguous(),
+                                  DS_IN[:, :, :, nc - nc_suf:].contiguous())
+            tf_s = {**fields, "S": S_suf,
+                    "Vf": fields["Vf"][s_tok:],
+                    "qkdot": fields["qkdot"][s_tok:],
+                    "dqkdot": fields["dqkdot"][:, s_tok:].contiguous()}
+            if fields.get("Zf") is not None:
+                tf_s["Zf"] = fields["Zf"][s_tok:]
+            return _maybe_compile(_finalize_postprocess_native, "finalize_nat")(
+                OUT_s[:, :S_suf], DOUT_s[:, :, :S_suf],
+                fin_dv[:, :, s_tok:],
+                None if fin_dz is None else fin_dz[:, :, s_tok:],
+                tf_s, mixer.out_proj.weight.t())
         if cs == 32 and r >= 4 and _gwalk_mod(N, P, Da, Sp) is not None:
             # Lane-batched wgmma dual walk: one launch for all r lanes.
             # cs==32 guards the L/DL chunk-locality contract of the walk.
@@ -866,6 +931,10 @@ def mamba3_mixer_jvp_kernel(
             DOUTn = torch.stack(dout_slices, dim=0)
         fwd_out, douts = _maybe_compile(_finalize_postprocess_native, "finalize_nat")(
             OUTn, DOUTn, fin_dv, fin_dz, fields, mixer.out_proj.weight.t())
+        if s_tok > 0:
+            # suffix contract honored by slicing when the pass route's shape
+            # guards did not hold (exact: the prefix tangent is zero).
+            return fwd_out[:, s_tok:], douts[:, :, s_tok:]
         return fwd_out, douts
 
     tangent_lanes = [
@@ -880,6 +949,8 @@ def mamba3_mixer_jvp_kernel(
         compute_dtype=compute_dtype, operand_dtype=operand_dtype, return_quad=True)
     fwd_out, douts = _maybe_compile(_finalize_postprocess_fused, "finalize_post")(
         out_quad, dout_quad, tf, mixer.out_proj.weight.t())
+    if s_tok > 0:
+        return fwd_out[:, s_tok:], douts[:, :, s_tok:]
     return fwd_out, douts
 
 
@@ -943,6 +1014,7 @@ def mamba3_region_output_jvp_kernel(
     chunk_size: "int | None" = None,
     operand_dtype: str = "bfloat16",
     pooled: bool = False,
+    tangent_token_start: int = 0,
 ) -> torch.Tensor:
     """Kernel-backed region JVP: same map as `mamba3_region_output_jvp` with
     the mixer scan JVP running through the fused dual-scan kernel; the
@@ -952,7 +1024,15 @@ def mamba3_region_output_jvp_kernel(
     `pooled`: the region tangent's only consumer in the A_k path is the
     interface meanpool, so the last block runs the mean-epilogue kernel and
     neither the [r,B,S,H,P] DOUT nor the full [B,r,L,D] region tangent exist
-    for that block. Returns [B, r, 1, D] (mean over L, keepdim)."""
+    for that block. Returns [B, r, 1, D] (mean over L, keepdim).
+
+    `tangent_token_start` > 0: the caller certifies the basis is zero before
+    that token; the whole tangent thread (norm JVPs, residual stream, mixer
+    tangent passes) then runs on the token suffix and the result is
+    zero-filled back to full length. Needs the cached preprocess for every
+    block (the primal scan fields must come from the forward caches, not
+    from the suffix-shaped residual chain); otherwise it degrades to the
+    full-length path, which is equally exact."""
     if region_input_tangent_basis.dim() != 4:
         raise ValueError("region_input_tangent_basis must have shape [B, r, L, D].")
     import os
@@ -968,11 +1048,7 @@ def mamba3_region_output_jvp_kernel(
         os.environ.get("LBI_FWDMODE_BCAST", "1") == "1"
         and (basis.shape[2] == 1 or basis.stride(2) == 0)
     )
-    # loop runs lane-major [r,B,L,D] (the kernels' native layout); one
-    # transpose at the return, none per block.
-    d_hidden = (basis[:, :, :1] if is_bcast else basis).to(compute_dtype).transpose(0, 1)
-    residual = None
-    d_residual = None
+    full_len = basis.shape[2]
     # per-block forward caches carry the primal in_proj + normed input;
     # the preprocess reads them instead of recomputing.
     lcs = getattr(cache, "layer_caches", None)
@@ -996,6 +1072,22 @@ def mamba3_region_output_jvp_kernel(
         if getattr(mc, "q_rot", None) is None or getattr(mc, "theta_cs", None) is None:
             return None
         return (mc.q_rot, mc.theta_cs)
+    s = int(tangent_token_start)
+    if s > 0:
+        gen_on = (os.environ.get("LBI_FWDMODE_GEN", "1") == "1"
+                  and operand_dtype == "bfloat16")
+        caches_ok = use_cachepre and all(
+            _mc(li) is not None for li in range(start, end))
+        if is_bcast or pooled or not gen_on or not caches_ok or s >= full_len:
+            s = 0
+    if s > 0:
+        hidden = hidden[:, s:]
+    # loop runs lane-major [r,B,L,D] (the kernels' native layout); one
+    # transpose at the return, none per block.
+    d_hidden = (basis[:, :, :1] if is_bcast
+                else basis[:, :, s:]).to(compute_dtype).transpose(0, 1)
+    residual = None
+    d_residual = None
     for layer_index in range(start, end):
         block = backend.backbone.blocks[layer_index]
         res_out = (hidden + residual) if residual is not None else hidden
@@ -1037,7 +1129,7 @@ def mamba3_region_output_jvp_kernel(
                 compute_dtype=compute_dtype, chunk_size=chunk_size,
                 operand_dtype=operand_dtype,
                 proj_cached=None if mc2 is None else mc2.in_proj,
-                fwd_caps=_caps(mc2))
+                fwd_caps=_caps(mc2), token_start=s)
         d_hidden = d_mix                                             # [r, B, L, D]
         residual = res_out
         d_residual = d_res_out
@@ -1046,4 +1138,10 @@ def mamba3_region_output_jvp_kernel(
         # Reached when the last block took the bcast fast path (e.g.
         # single-block regions); pool here instead of the mean kernel.
         out = out.mean(dim=2, keepdim=True)
-    return out.transpose(0, 1).contiguous().to(region_input_tangent_basis.dtype)
+    result = out.transpose(0, 1).to(region_input_tangent_basis.dtype)
+    if s > 0:
+        full = torch.zeros(result.shape[0], result.shape[1], full_len,
+                           result.shape[3], device=result.device, dtype=result.dtype)
+        full[:, :, s:] = result
+        return full
+    return result.contiguous()
