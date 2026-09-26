@@ -42,7 +42,7 @@ PYTHON_BIN=${PYTHON_BIN:-python} ./cuda/transformer/build.sh
 ${PYTHON_BIN:-python} -m pytest tests/ -q
 ```
 
-The tilelang kernel tests compile on first use and are opt-in with `LBI_TILELANG_TESTS=1`.
+The extension builds and the tilelang JIT need the CUDA 12.8 toolkit (`nvcc`) on `PATH` and an H100-class (sm_90a) device. The tilelang kernel tests compile on first use and are opt-in with `LBI_TILELANG_TESTS=1`.
 
 ## Third-Party Code
 
