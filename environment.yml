@@ -1,7 +1,5 @@
 name: lbi
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
 dependencies:
   - python=3.11
@@ -11,18 +9,15 @@ dependencies:
   - ninja
   - cmake
   - packaging
-  - numpy
-  - matplotlib
-  - pytest
-  - pytorch
-  - pytorch-cuda=12.1
-  - cuda-nvcc=12.1
   - pip:
-      - --no-build-isolation
-      - causal-conv1d==1.6.1
-      - datasets
-      - einops
-      - huggingface_hub
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.9.1
+      - triton==3.5.1
       - tilelang==0.1.12
+      - numpy
+      - einops
+      - matplotlib
+      - pytest
+      - datasets
+      - huggingface_hub
       - transformers
-      - triton
