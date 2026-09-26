@@ -157,8 +157,7 @@ class LBILanguageModel(nn.Module):
                 decode_canvas = self.region_view.decode_canvas(canvas_features, region_index)
                 condition = self.interface.decode(state_in, region_index)
                 canvas_read = self.viewed_canvas(canvas_features, region_index)
-                condition_wide = condition if condition.dim() == 3 else condition.unsqueeze(1)
-                region_input = canvas_read + condition_wide
+                region_input = canvas_read + condition.unsqueeze(1)
                 region_output, backend_cache = self.region_backend.forward_region(
                     region_input=region_input,
                     region_index=region_index,

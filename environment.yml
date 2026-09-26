@@ -23,6 +23,6 @@ dependencies:
       - datasets
       - einops
       - huggingface_hub
-      - sentencepiece
+      - tilelang==0.1.12
       - transformers
       - triton

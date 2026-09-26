@@ -4,7 +4,7 @@ This repository includes code adapted from upstream open-source projects.
 
 ## Mamba
 
-Portions of `backbones/mamba2/`, `backbones/mamba3/`, and `backbones/transformer/` are adapted from the official Mamba repository:
+Portions of `backbones/mamba3/` and `backbones/transformer/` are adapted from the official Mamba repository:
 
 ```text
 https://github.com/state-spaces/mamba
