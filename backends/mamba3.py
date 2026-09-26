@@ -1,16 +1,10 @@
-"""Mamba-3 SISO region backend and Torch-reference derivative lowering.
+"""Mamba-3 SISO region backend, its forward-cache contract, and the derivative
+lowerings: a Torch autograd reference and the native lowerings (scan pullback,
+epilogue pullback, parameter reductions) as `Mamba3Lowering` implementations.
 
-Defines the frozen forward-cache ABI and the region backend, with a Torch
-autograd reference lowering and the native lowerings (the scan pullback, the
-epilogue pullback, and the parameter reductions) as `Mamba3Lowering`
-implementations; the reference is the native lowerings' parity oracle.
-
-Forward-cache ABI
------------------
-`forward_region` threads the upstream `(hidden_states, residual)` state through
-the block range and records one `Mamba3LayerCache` per block. Each carries the
-block-level `Mamba3BlockForwardCache`, whose `mixer_cache` is the frozen
-`Mamba3ForwardCache` contract the kernel lowerings consume:
+`forward_region` threads `(hidden_states, residual)` through the block range
+and records one `Mamba3LayerCache` per block, whose `mixer_cache` is the
+`Mamba3ForwardCache` the lowerings consume:
 
 - input_u        [B, L, D]            block-mixer input (in_proj input)
 - in_proj        [B, L, C_in]         concatenated z|x|B|C|dd_dt|dd_A|trap|angles
@@ -26,11 +20,8 @@ block-level `Mamba3BlockForwardCache`, whose `mixer_cache` is the frozen
 - output         [B, L, D]            mixer output (out_proj output)
 
 The scan pullback consumes the transition factors (ADT, DT, angles) and the
-Q/K/V tiles (C, B, x); the parameter reductions additionally consume
-input_u, y_inner, and z for the projection/norm/bias VJPs. The reference
-lowering keeps the full forward cache resident; `recompute_forward` rebuilds
-it per region instead.
-"""
+Q/K/V tiles (C, B, x); the parameter reductions additionally consume input_u,
+y_inner, and z."""
 
 from __future__ import annotations
 
@@ -96,7 +87,6 @@ class Mamba3RegionBackend(nn.Module):
         region_ranges: Sequence[tuple[int, int]],
         backbone: BackboneStack | None = None,
         lowering: Mamba3Lowering | None = None,
-        recompute_forward: bool = False,
     ) -> None:
         super().__init__()
         if backbone is None:
@@ -108,9 +98,6 @@ class Mamba3RegionBackend(nn.Module):
         self.region_ranges = list(region_ranges)
         if not self.region_ranges:
             raise ValueError("mamba3 region backend requires at least one region")
-        # When True, store only the region input and recompute per-layer
-        # caches per region on demand (the store-vs-recompute knob).
-        self.recompute_forward = bool(recompute_forward)
 
     def _region_range(self, region_index: int) -> tuple[int, int]:
         try:
@@ -126,13 +113,6 @@ class Mamba3RegionBackend(nn.Module):
         region_input: torch.Tensor,
         region_index: int,
     ) -> tuple[torch.Tensor, Mamba3RegionCache]:
-        # recompute mode retains only region_input; the native backward
-        # rebuilds per-layer caches via materialize_region_cache.
-        return self._run_region(region_input, region_index, retain=not self.recompute_forward)
-
-    def _run_region(
-        self, region_input: torch.Tensor, region_index: int, *, retain: bool
-    ) -> tuple[torch.Tensor, Mamba3RegionCache]:
         start, end = self._region_range(region_index)
         hidden_states = region_input
         residual: torch.Tensor | None = None
@@ -142,8 +122,7 @@ class Mamba3RegionBackend(nn.Module):
             hidden_states, residual, block_cache = block.forward_with_cache(
                 hidden_states, residual=residual
             )
-            if retain:
-                layer_caches.append(Mamba3LayerCache(layer_index=layer_index, block=block_cache))
+            layer_caches.append(Mamba3LayerCache(layer_index=layer_index, block=block_cache))
         region_output = (hidden_states + residual) if residual is not None else hidden_states
         return region_output, Mamba3RegionCache(
             region_index=region_index,
@@ -152,19 +131,6 @@ class Mamba3RegionBackend(nn.Module):
             region_input=region_input,
             region_output=region_output,
         )
-
-    def materialize_region_cache(self, cache: Mamba3RegionCache) -> Mamba3RegionCache:
-        """Return a region cache with per-layer forward caches populated. If the
-        cache was trimmed (recompute mode), recompute the region forward once from
-        the retained region input under no_grad; otherwise return it unchanged.
-
-        The recomputed cache is scoped to a single region's backward and freed when
-        the caller drops it, so peak backward memory holds one region at a time."""
-        if cache.layer_caches:
-            return cache
-        with torch.no_grad():
-            _, full = self._run_region(cache.region_input, cache.region_index, retain=True)
-        return full
 
     def parameters_for_region(self, region_index: int) -> list[nn.Parameter]:
         start, end = self._region_range(region_index)
@@ -211,58 +177,18 @@ class Mamba3RegionBackend(nn.Module):
         region_input_tangent_basis: torch.Tensor,
         compute_dtype: "torch.dtype | None" = None,
         pooled: bool = False,
-        output_projection: "torch.Tensor | None" = None,
-        output_inner: "torch.Tensor | None" = None,
         tangent_token_start: int = 0,
+        direction_major_out: bool = False,
     ) -> torch.Tensor:
-        """Forward-mode region map: push a region-input tangent basis [B, P, L, D]
-        to a region-output tangent basis [B, P, L, D] at the frozen operating
-        point. This is the dual of `input_pullback_basis` and the region factor of
-        the forward-mode interface Jacobian. With `forward_mode_use_kernel`
-        (and tilelang available) the mixer scan JVP runs through the fused
-        dual-scan kernel; otherwise the torch.func reference path.
-
-        `pooled`: return the mean over L with keepdim, [B, P, 1, D]. Exact
-        for the A_k path, whose only consumer is the interface meanpool; the
-        kernel path folds the last block's finalize + meanpool on-chip.
-
-        `output_projection` [Rp, D] (with optional `output_inner` [B, L, D]):
-        return the projected tangent contraction instead of the full basis —
-        the token-weighted pooling form consumed by token-wise interfaces.
-
-        `compute_dtype=None` resolves per path: bf16 tangent stream on the
-        kernel path (LBI_FWDMODE_CD=float32 escapes), fp32 on the reference
-        path.
-
-        `tangent_token_start`: caller-certified first token with nonzero
-        tangent. The kernel path routes the scan through the pass kernels —
-        full-length primal pass A + tri pass B, tangent passes on the suffix
-        chunks only — and the projection epilogue contracts the suffix only;
-        paths that cannot restrict ignore it (full compute, equally exact)."""
-        if output_projection is not None:
-            if pooled:
-                raise ValueError("pooled and output_projection are mutually exclusive")
-            from backends.tangent_projection import lane_chunked_projection
-
-            return lane_chunked_projection(
-                lambda basis: self.region_output_jvp(
-                    cache=cache, region_input_tangent_basis=basis,
-                    compute_dtype=compute_dtype,
-                    tangent_token_start=tangent_token_start,
-                ),
-                region_input_tangent_basis,
-                output_projection=output_projection,
-                output_inner=output_inner,
-                tangent_token_start=tangent_token_start,
-            )
+        """Forward-mode region map: an input tangent basis [B, P, L, D] to the
+        output tangent basis, the dual of `input_pullback_basis`. `pooled` returns
+        the mean over L as [B, P, 1, D]; `compute_dtype=None` selects bf16 on the
+        kernel path and fp32 on the reference path."""
         if getattr(self, "forward_mode_use_kernel", False):
             from backends.mamba3_forward_mode import mamba3_region_output_jvp_kernel
 
             if compute_dtype is None:
-                import os
-                compute_dtype = (torch.float32
-                                 if os.environ.get("LBI_FWDMODE_CD") == "float32"
-                                 else torch.bfloat16)
+                compute_dtype = torch.bfloat16
             return mamba3_region_output_jvp_kernel(
                 self,
                 cache=cache,
@@ -270,6 +196,7 @@ class Mamba3RegionBackend(nn.Module):
                 compute_dtype=compute_dtype,
                 pooled=pooled,
                 tangent_token_start=tangent_token_start,
+                direction_major_out=direction_major_out,
             )
         from backends.mamba3_forward_mode import mamba3_region_output_jvp
 
@@ -279,6 +206,8 @@ class Mamba3RegionBackend(nn.Module):
             region_input_tangent_basis=region_input_tangent_basis,
             compute_dtype=compute_dtype if compute_dtype is not None else torch.float32,
         )
+        if direction_major_out:
+            out = out.transpose(0, 1)
         return out.mean(dim=2, keepdim=True) if pooled else out
 
     def parameter_vjp_with_input_cotangent(
@@ -288,7 +217,7 @@ class Mamba3RegionBackend(nn.Module):
         output_cotangent: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """Param grads plus the region-input cotangent (`P=1`) from a single
-        backward pass (and, under trimming, a single region recompute)."""
+        backward pass."""
         vjp = getattr(self.lowering, "parameter_vjp_with_input_cotangent", None)
         if vjp is None:
             grads = self.parameter_vjp(cache=cache, output_cotangent=output_cotangent)
@@ -302,7 +231,7 @@ class Mamba3RegionBackend(nn.Module):
 class TorchAutogradMamba3Lowering:
     """Reference lowering implemented with torch.autograd: re-runs the region
     forward from a detached input and differentiates, holding parameters fixed
-    for the input pullback. Parity oracle for the native lowerings.
+    for the input pullback; the native lowerings are checked against it.
     """
 
     name = "torch_autograd"
@@ -387,15 +316,12 @@ class TorchAutogradMamba3Lowering:
 
 
 class NativeMamba3Lowering:
-    """Native (autograd-free) Mamba-3 region lowering.
-
-    Composes the native block pullbacks (scan pullback + epilogue) and block
-    parameter VJPs (scan pullback at P=1 + parameter reductions) over the
-    region's block range. `input_pullback_basis` threads
-    the P-batched output cotangent backward through the blocks;
-    `parameter_vjp` threads the single real adjoint and accumulates parameter
-    grads. `TorchAutogradMamba3Lowering` is the parity oracle.
-    """
+    """Native (autograd-free) Mamba-3 region lowering. `input_pullback_basis`
+        threads a basis of P output cotangents backward through the blocks by the
+        native block pullbacks; `parameter_vjp` threads the single real adjoint
+        and accumulates the parameter grads. `TorchAutogradMamba3Lowering` is the
+        reference.
+        """
 
     name = "native"
 
@@ -408,7 +334,6 @@ class NativeMamba3Lowering:
     ) -> torch.Tensor:
         if output_cotangent_basis.dim() != 4:
             raise ValueError("output_cotangent_basis must have shape [B, P, L, D]")
-        cache = backend.materialize_region_cache(cache)
         # region_output = hidden + residual (last block) -> both seed the cotangent.
         g_hidden = output_cotangent_basis
         g_residual: torch.Tensor | None = output_cotangent_basis
@@ -445,8 +370,7 @@ class NativeMamba3Lowering:
         block loop that threads the adjoint back for the parameter reductions
         already produces the region-input cotangent as its final `g_hidden`, so the
         canvas contribution comes for free with no separate `input_pullback_basis`
-        (and, under trimming, no second region recompute)."""
-        cache = backend.materialize_region_cache(cache)
+        """
         g_hidden = output_cotangent
         g_residual: torch.Tensor | None = output_cotangent
         grads_by_param: dict = {}
@@ -468,147 +392,17 @@ class NativeMamba3Lowering:
         return out, g_hidden
 
 
-class TileLangPBatchedMamba3Lowering(NativeMamba3Lowering):
-    """Region lowering that runs the P-batched cotangent walk with the tilelang
-    lane-grid mixer pullback instead of the per-lane native path.
-
-    Only `input_pullback_basis` (the P=r A_k factor, Phase 1's hot loop) changes;
-    the P=1 parameter VJP inherits the native path, where P-batching buys
-    nothing. Wins in the launch-bound region regime (short per-region
-    sequences); requires tilelang.
-    """
-
-    name = "tilelang_pbatched"
-
-    def input_pullback_basis(
-        self,
-        *,
-        backend: Mamba3RegionBackend,
-        cache: Mamba3RegionCache,
-        output_cotangent_basis: torch.Tensor,
-    ) -> torch.Tensor:
-        from backbones.mamba3.ops.tilelang.mamba3.siso_pbatched import (
-            mamba3_mixer_input_pullback_pbatched,
-        )
-
-        if output_cotangent_basis.dim() != 4:
-            raise ValueError("output_cotangent_basis must have shape [B, P, L, D]")
-        cache = backend.materialize_region_cache(cache)
-        g_hidden = output_cotangent_basis
-        g_residual: torch.Tensor | None = output_cotangent_basis
-        for layer_cache in reversed(cache.layer_caches):
-            block = backend.backbone.blocks[layer_cache.layer_index]
-            g_hidden, g_residual = mamba3_block_input_pullback_native(
-                block=block,
-                cache=layer_cache.block,
-                output_cotangent_basis=g_hidden,
-                residual_cotangent_basis=g_residual,
-                mixer_pullback=lambda **kw: mamba3_mixer_input_pullback_pbatched(**kw),
-            )
-        return g_hidden
-
-
-class RegionLocalAutogradMamba3Lowering:
-    """Region-local checkpointed-autograd lowering.
-
-    Instead of the custom Triton backward orchestration (`NativeMamba3Lowering`),
-    re-run the region forward once from the trim checkpoint (`cache.region_input`)
-    under `enable_grad` and drive the OFFICIAL fused mamba backward via
-    `torch.autograd.grad`. This is still region-independent and bounded-memory (it
-    is per-region activation checkpointing: one region's graph, freed after), so
-    it composes with the scan engine / multi-device driver unchanged, with each
-    backward pass on the fused kernel. It ignores `layer_caches` entirely
-    (always re-forwards), so it is trim-agnostic.
-    """
-
-    name = "region_local_autograd"
-
-    @staticmethod
-    def _reforward(backend: "Mamba3RegionBackend", cache: Mamba3RegionCache):
-        start, end = backend._region_range(cache.region_index)
-        region_input = cache.region_input.detach().requires_grad_(True)
-        hidden = region_input
-        residual: torch.Tensor | None = None
-        for layer_index in range(start, end):
-            hidden, residual = backend.backbone.blocks[layer_index](hidden, residual=residual)
-        region_output = (hidden + residual) if residual is not None else hidden
-        return region_input, region_output
-
-    def input_pullback_basis(
-        self,
-        *,
-        backend: "Mamba3RegionBackend",
-        cache: Mamba3RegionCache,
-        output_cotangent_basis: torch.Tensor,
-    ) -> torch.Tensor:
-        if output_cotangent_basis.dim() != 4:
-            raise ValueError("output_cotangent_basis must have shape [B, P, L, D]")
-        with torch.enable_grad():
-            region_input, region_output = self._reforward(backend, cache)
-            basis = output_cotangent_basis.to(device=region_output.device, dtype=region_output.dtype)
-            cols = [
-                torch.autograd.grad(region_output, region_input, grad_outputs=basis[:, i], retain_graph=True)[0]
-                for i in range(basis.shape[1])
-            ]
-        return torch.stack(cols, dim=1).to(dtype=output_cotangent_basis.dtype)
-
-    def parameter_vjp(
-        self,
-        *,
-        backend: "Mamba3RegionBackend",
-        cache: Mamba3RegionCache,
-        output_cotangent: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        grads, _ = self.parameter_vjp_with_input_cotangent(
-            backend=backend, cache=cache, output_cotangent=output_cotangent
-        )
-        return grads
-
-    def parameter_vjp_with_input_cotangent(
-        self,
-        *,
-        backend: "Mamba3RegionBackend",
-        cache: Mamba3RegionCache,
-        output_cotangent: torch.Tensor,
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        params = list(backend.parameters_for_region(cache.region_index))
-        with torch.enable_grad():
-            region_input, region_output = self._reforward(backend, cache)
-            grads = torch.autograd.grad(
-                region_output,
-                [region_input, *params],
-                grad_outputs=output_cotangent.to(device=region_output.device, dtype=region_output.dtype),
-                allow_unused=True,
-            )
-        g_region_input = grads[0]
-        name_by_id = {id(param): name for name, param in backend.named_parameters()}
-        out: dict[str, torch.Tensor] = {}
-        for param, grad in zip(params, grads[1:]):
-            name = name_by_id.get(id(param))
-            if grad is not None and name is not None:
-                out[name] = grad.detach().clone()
-        return out, g_region_input.detach()
-
-
 # Mixer input-pullback contract (the scan pullback composed with the epilogue).
 
 
 class Mamba3MixerLowering(Protocol):
-    """Contract for the Mamba-3 state-mixer matrix-valued input pullback.
-
-    `input_pullback_basis` maps a P-batched cotangent on the mixer output to the
-    P-batched cotangent on the mixer input `u`, holding mixer parameters fixed:
-
-        (cache: Mamba3ForwardCache, output_cotangent_basis [B, P, L, D])
-            -> input_cotangent_basis [B, P, L, D]
-
-    `D` is the mixer's model dimension; `P` is the cotangent-basis batch (the
-    interface rank `r` when materializing an interface Jacobian, or 1 for a
-    real adjoint). The native lowering realizes this contract as the scan
-    pullback composed with the epilogue pullback. `cache` is the frozen
-    `Mamba3ForwardCache` ABI documented in this module; the reference lowering
-    is the parity oracle.
-    """
+    """Contract for the Mamba-3 mixer's matrix-valued input pullback:
+        `input_pullback_basis(cache, output_cotangent_basis [B, P, L, D])` returns
+        the input cotangent basis [B, P, L, D] with the mixer parameters held fixed.
+        `P` is the cotangent-basis batch (the interface rank r when materializing
+        an interface Jacobian, or 1 for a real adjoint). `cache` is the
+        `Mamba3ForwardCache` documented in this module.
+        """
 
     name: str
 
@@ -692,19 +486,11 @@ class TorchAutogradMamba3MixerLowering:
 
 
 class NativeMamba3MixerLowering:
-    """Native (autograd-free) mixer input pullback.
-
-    Composes `out_proj^T`, the scan pullback (`mamba3_siso_scan_input_pullback_basis`,
-    which drives the official Triton kernels per lane), the preprocess/RMSNorm
-    VJPs, and `in_proj^T`. No `torch.autograd` in the path. `allow_reference_fallback`
-    forces the autograd reference instead, for parity testing.
-    """
+    """Native (autograd-free) mixer input pullback: `out_proj^T`, the scan
+    pullback (`mamba3_siso_scan_input_pullback_basis`), the preprocess and
+    RMSNorm VJPs, and `in_proj^T`."""
 
     name = "native"
-
-    def __init__(self, *, allow_reference_fallback: bool = False) -> None:
-        self.allow_reference_fallback = bool(allow_reference_fallback)
-        self._reference = TorchAutogradMamba3MixerLowering()
 
     def input_pullback_basis(
         self,
@@ -713,51 +499,11 @@ class NativeMamba3MixerLowering:
         cache: Mamba3ForwardCache,
         output_cotangent_basis: torch.Tensor,
     ) -> torch.Tensor:
-        if self.allow_reference_fallback:
-            return self._reference.input_pullback_basis(
-                mixer=mixer,
-                cache=cache,
-                output_cotangent_basis=output_cotangent_basis,
-            )
         return mamba3_mixer_input_pullback_native(
             mixer=mixer,
             cache=cache,
             output_cotangent_basis=output_cotangent_basis,
         )
-
-
-class TileLangPBatchedMamba3MixerLowering:
-    """P-batched mixer input pullback via the tilelang lane-grid MIMO backward.
-
-    Composes `out_proj^T`, the lane-grid P-batched scan pullback (one kernel
-    pair for all P lanes: shared cotangent-independent pass + per-lane-CTA
-    backward), and the closed-form lane-batched preprocess VJP. All P lanes
-    complete in a fixed number of launches, which wins in the launch-bound
-    short-sequence regime. Requires tilelang (JIT, cached).
-    """
-
-    name = "tilelang_pbatched"
-
-    def input_pullback_basis(
-        self,
-        *,
-        mixer: nn.Module,
-        cache: Mamba3ForwardCache,
-        output_cotangent_basis: torch.Tensor,
-    ) -> torch.Tensor:
-        from backbones.mamba3.ops.tilelang.mamba3.siso_pbatched import (
-            mamba3_mixer_input_pullback_pbatched,
-        )
-
-        return mamba3_mixer_input_pullback_pbatched(
-            mixer=mixer,
-            cache=cache,
-            output_cotangent_basis=output_cotangent_basis,
-        )
-
-
-# Backwards-compatible alias (the scan is native Triton; the epilogues are torch).
-TritonMamba3MixerLowering = NativeMamba3MixerLowering
 
 
 # Scan-boundary input pullback (the scan backward recurrence).
@@ -792,17 +538,13 @@ def mamba3_siso_scan_input_pullback_basis(
     cache: Mamba3ForwardCache,
     output_cotangent_basis: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Matrix-valued input pullback of the SISO selective scan.
-
-    Maps a P-batched cotangent on the scan output `[B, P, L, H, Dv]` to the
-    P-batched activation adjoints on the scan inputs (Q=C, K=B, V=x, ADT, DT,
-    Trap, Angles, Z), holding parameters (Q/K biases, D) fixed.
-
-    Recomputes the scan forward once via `mamba3_siso_fwd` and drives the
-    Triton backward kernels directly for each of the `P` cotangent lanes,
-    discarding parameter (`dD`, `dQ_bias`, `dK_bias`) and inference-state
-    grads; the forward is shared across `P`. No `torch.autograd` in the path.
-    """
+    """Matrix-valued input pullback of the SISO selective scan: a basis of P
+        cotangents on the scan output `[B, P, L, H, Dv]` to the activation adjoints
+        on the scan inputs (Q=C, K=B, V=x, ADT, DT, Trap, Angles, Z), parameters
+        held fixed. The scan forward is recomputed once with `mamba3_siso_fwd` and
+        shared across the P directions, each driven through the Triton backward
+        kernels.
+        """
     if output_cotangent_basis.dim() != 5:
         raise ValueError("output_cotangent_basis must have shape [B, P, L, H, Dv]")
 
@@ -811,7 +553,7 @@ def mamba3_siso_scan_input_pullback_basis(
     columns: dict[str, list[torch.Tensor]] = {name: [] for name in MAMBA3_SCAN_INPUT_NAMES}
     for basis_index in range(output_cotangent_basis.shape[1]):
         grad_out = output_cotangent_basis[:, basis_index].to(device=tiles["out_v"].device, dtype=scan["V"].dtype)
-        inputs, _params = _mamba3_scan_lane_backward(mixer, tiles, grad_out)
+        inputs, _params = _mamba3_scan_direction_backward(mixer, tiles, grad_out)
         for name in MAMBA3_SCAN_INPUT_NAMES:
             columns[name].append(inputs[name].unsqueeze(1))
 
@@ -850,9 +592,9 @@ def _mamba3_recompute_scan_tiles(mixer: nn.Module, cache: Mamba3ForwardCache) ->
     }
 
 
-def _mamba3_scan_lane_backward(mixer: nn.Module, tiles: dict, grad_out: torch.Tensor):
-    """One-lane SISO scan backward. Returns (scan-input adjoints, scan-param grads
-    `{dD, dC_bias, dB_bias}`). 4a discards the params; the parameter VJP keeps them."""
+def _mamba3_scan_direction_backward(mixer: nn.Module, tiles: dict, grad_out: torch.Tensor):
+    """One-direction SISO scan backward. Returns (scan-input adjoints, scan-param grads
+    `{dD, dC_bias, dB_bias}`). The input pullback discards the params; the parameter VJP keeps them."""
     from backbones.mamba3.ops.triton.mamba3.mamba3_siso_bwd import (
         compute_ddt_dtrap_dinput_states, compute_dqktheta, compute_dqkv, compute_dzdo,
     )
@@ -893,11 +635,10 @@ def _mamba3_scan_lane_backward(mixer: nn.Module, tiles: dict, grad_out: torch.Te
 
 
 def _rmsnorm_vjp(dy: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """VJP of RMSNorm (no bias, no gate) w.r.t. its input `x`.
-
-    `dy` may carry a leading `P` axis that broadcasts against the shared,
-    cotangent-independent `x`. Returns `dx` in fp32.
-    """
+    """VJP of RMSNorm (no bias, no gate) with respect to its input `x`. `dy`
+        may carry a leading `P` axis that broadcasts against the shared `x`;
+        returns `dx` in fp32.
+        """
     xf = x.float()
     dyf = dy.float()
     wf = weight.float()
@@ -914,14 +655,12 @@ def mamba3_mixer_input_pullback_native(
     cache: Mamba3ForwardCache,
     output_cotangent_basis: torch.Tensor,
 ) -> torch.Tensor:
-    """Native (autograd-free) mixer input pullback.
-
-    Maps a P-batched cotangent on the mixer output `[B, P, L, D]` to the
-    cotangent on the mixer input `u`, parameters held fixed. Composes
-    `out_proj^T`, the scan pullback (`mamba3_siso_scan_input_pullback_basis`),
-    the preprocess/RMSNorm VJPs, and `in_proj^T`. Preprocess intermediates are
-    recomputed from the frozen forward cache rather than stored.
-    """
+    """Native (autograd-free) mixer input pullback: a basis of P cotangents on
+        the mixer output `[B, P, L, D]` to the cotangent on the mixer input `u`,
+        parameters held fixed. Composes `out_proj^T`, the scan pullback, the
+        preprocess and RMSNorm VJPs, and `in_proj^T`, recomputing the preprocess
+        intermediates from the frozen forward cache.
+        """
     if output_cotangent_basis.dim() != 4:
         raise ValueError("output_cotangent_basis must have shape [B, P, L, D]")
     bsz, num_p, seqlen, _ = output_cotangent_basis.shape
@@ -988,15 +727,13 @@ def mamba3_block_input_pullback_native(
     residual_cotangent_basis: torch.Tensor | None = None,
     mixer_pullback=None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Native (autograd-free) pullback for one `Mamba3Block`.
-
-    The block is `residual_out = hidden_in + residual_in; hidden_out =
-    mixer(RMSNorm(residual_out))`, returning `(hidden_out, residual_out)`. Given
-    the P-batched output cotangents `(g_hidden_out, g_residual_out)`, returns the
-    input cotangents `(g_hidden_in, g_residual_in)`. Composes the mixer input
-    pullback (`mixer_pullback`, default the native per-lane path) and the RMSNorm
-    VJP; replaces the autograd path in `Mamba3Block.input_pullback_matrix`.
-    """
+    """Native (autograd-free) pullback for one `Mamba3Block`, whose forward is
+        `residual_out = hidden_in + residual_in; hidden_out = mixer(RMSNorm(residual_out))`.
+        Given the output cotangents `(g_hidden_out, g_residual_out)`, each with a
+        leading P axis, returns the input cotangents `(g_hidden_in, g_residual_in)`
+        by composing the mixer input pullback (`mixer_pullback`, default the native
+        path) and the RMSNorm VJP.
+        """
     if mixer_pullback is None:
         mixer_pullback = mamba3_mixer_input_pullback_native
     # hidden_out path: mixer^T then RMSNorm^T -> cotangent on residual_out.
@@ -1034,16 +771,12 @@ def _rmsnorm_weight_grad(dy: torch.Tensor, x: torch.Tensor, eps: float) -> torch
     return dw.reshape(-1, dw.shape[-1]).sum(0)
 
 
-# Compiled VJP glue stages: the elementwise/norm/projection tails around the
-# opaque scan kernels; LBI_MAMBA_VJP_COMPILE=0 opts out.
+# Compiled VJP peripheral stages: the elementwise/norm/projection tails around the
+# opaque scan kernels.
 _VJP_COMPILED: dict = {}
 
 
 def _vjp_compiled(fn):
-    import os
-
-    if os.environ.get("LBI_MAMBA_VJP_COMPILE", "1") == "0":
-        return fn
     c = _VJP_COMPILED.get(fn)
     if c is None:
         c = torch.compile(fn, dynamic=False)
@@ -1122,7 +855,7 @@ def mamba3_mixer_param_vjp_native(
 ) -> tuple[torch.Tensor, dict]:
     """Native mixer parameter VJP at `P = 1`: returns `(g_u [B, L, D],
     {param -> grad})`. The scan pullback runs the SISO backward kernels; the
-    glue on either side runs as two compiled stages."""
+    peripheral on either side runs as two compiled stages."""
     grads: dict = {}
     g_wout, g_scan_out = _vjp_compiled(_mixer_vjp_head)(
         output_cotangent, cache.y_inner, mixer.out_proj.weight,
@@ -1131,7 +864,7 @@ def mamba3_mixer_param_vjp_native(
 
     # scan pullback at P=1: scan-input adjoints + scan-param grads
     tiles = _mamba3_recompute_scan_tiles(mixer, cache)
-    inputs, scan_params = _mamba3_scan_lane_backward(mixer, tiles, g_scan_out.to(dtype=tiles["scan"]["V"].dtype))
+    inputs, scan_params = _mamba3_scan_direction_backward(mixer, tiles, g_scan_out.to(dtype=tiles["scan"]["V"].dtype))
     grads[mixer.D] = scan_params["dD"].to(mixer.D.dtype)
     grads[mixer.C_bias] = scan_params["dC_bias"].unsqueeze(1).to(mixer.C_bias.dtype)
     grads[mixer.B_bias] = scan_params["dB_bias"].unsqueeze(1).to(mixer.B_bias.dtype)

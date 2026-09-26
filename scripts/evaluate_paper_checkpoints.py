@@ -1,3 +1,7 @@
+"""Post-hoc evaluation of the saved paper checkpoints (every printed
+cross-entropy): a fixed held-out token sample per run, written as
+lm_eval_summary.{csv,json}."""
+
 from __future__ import annotations
 
 import argparse
@@ -12,15 +16,11 @@ from typing import Any
 import torch
 
 from train.checkpointing import load_checkpoint as _load_checkpoint
-from train.config import DENSE_VARIANT, LBI_VARIANT, compatible_output_names_for_variant, normalize_model_variant
+from train.config import LBI_VARIANT, VARIANTS, LBITrainingConfig, normalize_model_variant
 from train.data import build_corpora as _build_corpora, sample_batch_any as _sample_batch_any
 from train.eval import next_token_loss as _next_token_loss
 from train.model_builders import build_model_for_regime
-from train.lbi import (
-    LBITrainingConfig,
-    _autocast_context,
-    _resolve_device,
-)
+from train.runners import _autocast_context, _resolve_device
 
 
 def _run_sort_key(path: Path) -> tuple[int, int, str]:
@@ -48,30 +48,13 @@ def _discover_run_dirs(family_dir: Path) -> list[Path]:
         if path.is_dir()
         and (path / "config.json").exists()
         and (path / "summary.json").exists()
-        and path.name in {*compatible_output_names_for_variant(DENSE_VARIANT), *compatible_output_names_for_variant(LBI_VARIANT)}
+        and path.name in VARIANTS
     ]
     return sorted(candidates, key=_run_sort_key)
 
 
-# Saved configs predating an interface/canvas field must rebuild with that
-# era's behavior, not today's defaults.
-_LEGACY_CONFIG_DEFAULTS = {
-    "interface_type": "vector_mlp",
-    "interface_chunks": 1,
-    "interface_chunks_strict": False,
-    "interface_chunk_norm": "layer",
-    "canvas_output_readout": False,
-    "canvas_state_readout": False,
-    "canvas_region_view": False,
-    "canvas_local_mixer": 0,
-    "message_dim": 64,
-}
-
-
 def _load_config(run_dir: Path, *, args: argparse.Namespace) -> LBITrainingConfig:
     raw = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
-    for key, value in _LEGACY_CONFIG_DEFAULTS.items():
-        raw.setdefault(key, value)
     allowed = {item.name for item in fields(LBITrainingConfig)}
     cfg = LBITrainingConfig(**{key: value for key, value in raw.items() if key in allowed})
     variant = normalize_model_variant(run_dir.name)
@@ -109,10 +92,6 @@ def _checkpoint_from_summary(run_dir: Path, checkpoint_name: str) -> Path:
     raise FileNotFoundError(f"no {checkpoint_name}.pt checkpoint found for {run_dir}")
 
 
-def _build_model(cfg: LBITrainingConfig, *, checkpoint: dict[str, Any]) -> torch.nn.Module:
-    return build_model_for_regime(cfg, checkpoint=checkpoint)
-
-
 def _safe_exp(value: float) -> float:
     try:
         return float(math.exp(value))
@@ -128,8 +107,7 @@ def _evaluate_loaded_model(
     generator_seed: int,
     device: torch.device,
 ) -> dict[str, float]:
-    generator_device = device if cfg.data_mode == "synthetic" else torch.device("cpu")
-    generator = torch.Generator(device=generator_device)
+    generator = torch.Generator(device="cpu")
     generator.manual_seed(generator_seed)
 
     model.eval()
@@ -165,11 +143,8 @@ def _evaluate_loaded_model(
     }
 
 
-def _run_label(run_dir: Path, cfg: LBITrainingConfig) -> str:
-    variant = run_dir.parent.name
-    if normalize_model_variant(cfg.regime) == DENSE_VARIANT:
-        return variant.replace("dense_", "dense_")
-    return variant
+def _run_label(run_dir: Path) -> str:
+    return run_dir.parent.name
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -184,10 +159,10 @@ def _evaluate_run(run_dir: Path, *, args: argparse.Namespace) -> dict[str, Any]:
     checkpoint_path = _checkpoint_from_summary(run_dir, args.checkpoint)
     checkpoint = _load_checkpoint(checkpoint_path, device=device)
 
-    model = _build_model(cfg, checkpoint=checkpoint).to(device=device, dtype=torch.float32)
+    model = build_model_for_regime(cfg).to(device=device, dtype=torch.float32)
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    _, val_corpus = _build_corpora(cfg, device=device)
+    _, val_corpus = _build_corpora(cfg)
     metrics = _evaluate_loaded_model(
         cfg=cfg,
         model=model,
@@ -199,7 +174,7 @@ def _evaluate_run(run_dir: Path, *, args: argparse.Namespace) -> dict[str, Any]:
     summary = _read_json(run_dir / "summary.json")
     model_info = _read_json(run_dir / "model_info.json")
     row: dict[str, Any] = {
-        "label": _run_label(run_dir, cfg),
+        "label": _run_label(run_dir),
         "run_dir": str(run_dir),
         "variant": normalize_model_variant(cfg.regime),
         "regime": cfg.regime,
@@ -279,7 +254,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Family directory containing dense_seed*/ and lbi_r*_seed*/ runs, or a single regime run directory.",
     )
     parser.add_argument("--output-dir", type=str, default="", help="Directory for lm_eval_summary.{csv,json}.")
-    parser.add_argument("--checkpoint", choices=("best", "latest"), default="best")
+    parser.add_argument("--checkpoint", choices=("best", "latest"), default="latest")
     parser.add_argument("--eval-batches", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--seq-len", type=int, default=None)

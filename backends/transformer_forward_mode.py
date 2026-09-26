@@ -1,20 +1,15 @@
 """Forward-mode region JVP for the transformer backend.
 
 `transformer_region_output_jvp` is the torch.func reference: a differentiable
-region replay (chunked math attention; flash has no forward-AD rule) with the
-P tangent lanes riding a vmap over torch.func.jvp.
-`transformer_region_output_jvp_kernel` runs the lanes lane-major [r, B, L, D]
-through the CUDA/triton kernels, with tangent GEMMs flattened to single
-[r*B*L, d] calls. For an L-constant tangent basis the first block's norm +
-in_proj tangent collapses exactly to s*U_j - a_j*qkv (`LBI_FWDMODE_BCAST=0`
-disables the collapse for general bases).
-"""
+region replay with chunked math attention and the P tangent directions under
+vmap over torch.func.jvp. `transformer_region_output_jvp_kernel` runs the
+directions direction-major [r, B, L, D] through the CUDA and Triton kernels
+with the tangent GEMMs flattened to single [r*B*L, d] calls; for an
+L-constant tangent basis the first block's norm and in_proj tangent collapses
+exactly to s*U_j - a_j*qkv."""
 from __future__ import annotations
 
-import os
-
 import torch
-import torch.nn.functional as F
 
 from backbones.transformer.rope import _rope_tables, apply_rope
 from backends.transformer import softmax_scale
@@ -87,17 +82,13 @@ def transformer_region_output_jvp(backend, *, cache, region_input_tangent_basis,
     return out.movedim(0, 1).contiguous().to(region_input_tangent_basis.dtype)
 
 
-def _linear_jvp(lin, x, t):
-    """Primal + tangent through a linear layer; the tangent GEMM is flattened
-    to one [r*B*L, d] call (bias drops from the tangent)."""
-    r, B, L, d = t.shape
-    dy = (t.reshape(-1, d) @ lin.weight.t()).reshape(r, B, L, -1)
-    return lin(x), dy
-
-
 def _linear_tangent(lin, t):
     r, B, L, d = t.shape
-    return (t.reshape(-1, d) @ lin.weight.t()).reshape(r, B, L, -1)
+    w = lin.weight
+    if w.dtype != t.dtype:
+        # harmonize to the weight dtype (mixed-precision training contexts)
+        return (t.reshape(-1, d).to(w.dtype) @ w.t()).reshape(r, B, L, -1).to(t.dtype)
+    return (t.reshape(-1, d) @ w.t()).reshape(r, B, L, -1)
 
 
 def _swiglu_tangent(gate, up, activation, dup, dgate, dtype):
@@ -109,15 +100,6 @@ def _swiglu_tangent(gate, up, activation, dup, dgate, dtype):
     return dup * activation.to(dtype) + up.to(dtype).unsqueeze(0) * dsilu * dgate
 
 
-def _mlp_jvp(mlp, x, t):
-    h, dh = _linear_jvp(mlp.fc1, x, t)
-    up, gate = h.chunk(2, dim=-1)
-    dup, dgate = dh.chunk(2, dim=-1)
-    silu = (gate.float() * torch.sigmoid(gate.float())).to(x.dtype)
-    dmid = _swiglu_tangent(gate, up, silu, dup, dgate, x.dtype)
-    return _linear_jvp(mlp.fc2, up * silu, dmid)
-
-
 def _norm_collapse_terms(norm, lin, x, t):
     """Scalars for the in-kernel first-block tangent synthesis (L-constant
     basis): dx = s*U_j - a_j*x with s = rsqrt(ms) [B,L], a = s^2*mean(x.*t_c)
@@ -126,26 +108,23 @@ def _norm_collapse_terms(norm, lin, x, t):
     s = torch.rsqrt(xf.pow(2).mean(dim=-1) + norm.eps)
     w = norm.weight.to(x.dtype)
     tc = t[:, :, 0, :]
-    U = ((w * tc).reshape(-1, tc.shape[-1]) @ lin.weight.t()).reshape(
-        t.shape[0], t.shape[1], -1)
+    # matmul operands harmonized to the projection weight's dtype (training
+    # contexts can hold in_proj at a different precision than the tangents)
+    wd = lin.weight.dtype
+    U = ((w * tc).to(wd).reshape(-1, tc.shape[-1]) @ lin.weight.t()).reshape(
+        t.shape[0], t.shape[1], -1).to(t.dtype)
     a = s.pow(2).unsqueeze(0) * (torch.einsum("bld,rbd->rbl", xf, tc.float())
                                  / x.shape[-1])
     return U, s, a
 
 
-# Compiled cache-fed chains, keyed by (region range, tangent shape, pooled);
-# LBI_FWDMODE_COMPILE opts in (first call pays the compile).
-_COMPILED_CHAINS: dict = {}
-
 _CUDA_ATTN_JVP = None  # wrapper once resolved; False when unavailable
 
 
 def _resolve_cuda_attn_jvp():
-    """The CUDA flash-JVP wrapper, or None on non-Hopper devices, failed
-    builds, or LBI_FWDMODE_CUDA_ATTN=0 (the triton kernel runs instead)."""
+    """The CUDA flash-JVP wrapper, or None on non-Hopper devices or failed
+    builds (the Triton kernel runs instead)."""
     global _CUDA_ATTN_JVP
-    if os.environ.get("LBI_FWDMODE_CUDA_ATTN", "1") == "0":
-        return None
     if _CUDA_ATTN_JVP is None:
         try:
             from cuda.transformer import (
@@ -160,31 +139,36 @@ def _resolve_cuda_attn_jvp():
     return _CUDA_ATTN_JVP or None
 
 
-def _cache_fed_tangent_chain(backend, layer_caches, start, end, t,
-                             collapse_first, compute_dtype, pooled,
-                             cuda_attn_fn=None, token_start=0):
-    """The cache-fed tangent thread as one compilable function: every primal
-    operating point comes from the caches; the custom kernels trace opaque.
+def _linear_tangent_add(lin, t, res):
+    """res + t @ W^T in one GEMM epilogue (cuBLAS beta=1): the residual
+    add of the tangent chain folded into the projection, one pass over
+    the tangent stack fewer than the unfused (GEMM, then add) pair."""
+    r, B, L, d = t.shape
+    w = lin.weight
+    if w.dtype != t.dtype or res.dtype != t.dtype:
+        return _linear_tangent(lin, t) + res
+    return torch.addmm(res.reshape(-1, res.shape[-1]), t.reshape(-1, d), w.t()).reshape(res.shape)
 
-    `token_start` > 0 runs the whole tangent thread on the token suffix only
-    (`t` arrives suffix-shaped [r, B, L - s, D]). Exact when the true tangent
-    is zero before `token_start`: every per-token op slices, the conv's
-    zero left-pad IS the zero tangent at the boundary, the rope tables shift
-    to absolute positions, and the flash JVP runs suffix queries against the
-    full-length cached keys/values."""
+
+def _cache_fed_tangent_chain_fused(backend, layer_caches, start, end, t,
+                                   collapse_first, compute_dtype, pooled,
+                                   cuda_attn_fn=None, token_start=0):
+    """The cache-fed tangent chain: every primal operating point comes from
+    the region caches, both residual adds per block fold into the out_proj /
+    fc2 GEMM epilogues (`_linear_tangent_add`), and the SwiGLU tangent runs as
+    one Triton pass. With `token_start` > 0 the chain runs on the token suffix
+    only, exact when the tangent is zero before it."""
     from backbones.transformer.ops.triton.region_jvp import (
-        flash_attention_jvp, fused_qkv_prep, rmsnorm_jvp)
+        flash_attention_jvp, fused_qkv_prep, rmsnorm_jvp, swiglu_jvp)
 
     s = int(token_start)
-    dres = None
-    dh = t
+    dres = t
     for i, layer_index in enumerate(range(start, end)):
         blk = backend.backbone.blocks[layer_index]
         attn = blk.attn
         hd = attn.head_dim
         lc = layer_caches[i]
         L = lc.attention.norm_input.shape[-2]
-        dres = dh + dres if dres is not None else dh
         x_attn = lc.attention.norm_input[:, s:].to(compute_dtype)
         if i == 0 and collapse_first and s == 0 and attn.in_proj.bias is None:
             qkv_pre = lc.attention.qkv_preconv
@@ -194,9 +178,9 @@ def _cache_fed_tangent_chain(backend, layer_caches, start, end, t,
             dqkv = None
             shape_src = qkv_pre.contiguous()
         else:
-            _, dnh = rmsnorm_jvp(x_attn.contiguous(), dres.contiguous(),
-                                 blk.norm.weight, blk.norm.eps, emit_y=False)
-            dqkv = _linear_tangent(attn.in_proj, dnh).contiguous()
+            _, dnh = rmsnorm_jvp(x_attn.contiguous(), dres, blk.norm.weight, blk.norm.eps,
+                                 emit_y=False)
+            dqkv = _linear_tangent(attn.in_proj, dnh)
             synth = None
             shape_src = dqkv[0]
         cos, sin = _rope_tables(L, hd // 2, attn.rope_base, x_attn.device)
@@ -208,27 +192,28 @@ def _cache_fed_tangent_chain(backend, layer_caches, start, end, t,
         q = lc.attention.q_rope.contiguous()
         k = lc.attention.k_rope.contiguous()
         v = lc.attention.v.contiguous()
+        rep = attn.n_heads // attn.n_kv_heads
+        if rep > 1:
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+            dk = dk.repeat_interleave(rep, dim=2)
+            dv = dv.repeat_interleave(rep, dim=2)
         scale = softmax_scale(attn)
         if cuda_attn_fn is not None and s == 0 and hd == 64 and L % 64 == 0:
-            # Flat-layout epilogue: do arrives [r, B, L, H*hd], out_proj-ready.
             _, do = cuda_attn_fn(q, k, v, dq, dk, dv, scale)
         else:
             _, do = flash_attention_jvp(q, k, v, dq, dk, dv, scale, query_start=s)
             do = do.transpose(-3, -2).flatten(-2)
-        dh = _linear_tangent(attn.out_proj, do)
-        dres = dh + dres
+        dres = _linear_tangent_add(attn.out_proj, do, dres)
         x_mlp = lc.mlp.norm_input[:, s:].to(compute_dtype)
-        _, dnh = rmsnorm_jvp(x_mlp.contiguous(), dres.contiguous(),
-                             blk.norm2.weight, blk.norm2.eps, emit_y=False)
+        _, dnh = rmsnorm_jvp(x_mlp.contiguous(), dres, blk.norm2.weight, blk.norm2.eps,
+                             emit_y=False)
         dh1 = _linear_tangent(blk.mlp.fc1, dnh)
-        dup, dgate = dh1.chunk(2, dim=-1)
-        dmid = _swiglu_tangent(lc.mlp.gate[:, s:], lc.mlp.up[:, s:],
-                               lc.mlp.activation[:, s:], dup, dgate, compute_dtype)
-        dh = _linear_tangent(blk.mlp.fc2, dmid)
-    dout = dh + dres
+        dmid = swiglu_jvp(lc.mlp.gate[:, s:], lc.mlp.up[:, s:], lc.mlp.activation[:, s:],
+                          dh1 if dh1.is_contiguous() else dh1.contiguous())
+        dres = _linear_tangent_add(blk.mlp.fc2, dmid, dres)
+    dout = dres
     if pooled:
-        # The suffix sum over the true (zero-prefix) tangent divided by the
-        # FULL length is the exact full-sequence mean.
         dout = dout.sum(dim=2, keepdim=True) / float(L) if s else dout.mean(dim=2, keepdim=True)
     return dout
 
@@ -240,7 +225,7 @@ def _kernel_path_supported(backend, start, end):
     for layer_index in range(start, end):
         attn = backend.backbone.blocks[layer_index].attn
         hd = attn.head_dim
-        if (attn.d_conv <= 0 or attn.n_heads != attn.n_kv_heads
+        if (attn.d_conv <= 0 or attn.n_heads % attn.n_kv_heads
                 or attn.rope_interleaved or hd & (hd - 1) or hd < 16):
             return False
     return True
@@ -251,102 +236,63 @@ def transformer_region_output_jvp_kernel(backend, *, cache,
                                          compute_dtype=torch.bfloat16,
                                          pooled=False,
                                          tangent_token_start=0):
-    """Kernel tangent map, lane-major [r, B, L, D] internally. Falls back to
-    the reference path for module configurations outside the kernel contract
-    (grouped KV heads, interleaved rope, no conv, non-power-of-two widths).
-
-    `tangent_token_start` > 0: the caller certifies the tangent basis is zero
-    before that token; the cache-fed chain then computes only the suffix and
-    the result is zero-filled back to full length. Exact; ignored (full
-    compute, still exact) on the fallback and recompute paths."""
+    """Kernel tangent map, direction-major [r, B, L, D] internally, reading every
+    primal operating point from the region forward's layer caches; falls back to
+    the reference path for module configurations outside the kernel contract.
+    With `tangent_token_start` > 0 the chain computes only the suffix the caller
+    certifies as nonzero and zero-fills the prefix."""
     start, end = cache.layer_range
+    if region_input_tangent_basis.dtype is not torch.bfloat16:
+        # The fused attention JVP computes in bf16 and its fp32 inputs are not
+        # promoted consistently (the result is a non-finite Jacobian rather
+        # than an error); fail like the Mamba-3 backend does.
+        raise ValueError(
+            "transformer forward-mode construction requires dtype=bfloat16; "
+            "use interface_jacobian_mode='graph' for float32")
     if not _kernel_path_supported(backend, start, end):
+        if not getattr(backend, "_fwdmode_fallback_warned", False):
+            backend._fwdmode_fallback_warned = True
+            import warnings
+
+            warnings.warn(
+                "transformer forward-mode kernel path unsupported for this "
+                "module configuration (needs power-of-two dim/head_dim >= 16, "
+                "n_heads divisible by n_kv_heads, conv > 0, non-interleaved rope); "
+                "falling back to the reference JVP at ~5-10x the cost.",
+                stacklevel=2,
+            )
         out = transformer_region_output_jvp(
             backend, cache=cache,
             region_input_tangent_basis=region_input_tangent_basis,
             compute_dtype=compute_dtype)
         return out.mean(dim=2, keepdim=True) if pooled else out
 
-    from backbones.transformer.ops.triton.region_jvp import (
-        flash_attention_jvp, fused_qkv_prep, rmsnorm_jvp)
-
-    x = cache.region_input
-    # The first-block collapse is exact only for an L-constant tangent basis
-    # (broadcast decodes); token-varying bases (tokenwise decodes) must take
-    # the general norm-JVP path. Detect before contiguous() expands stride-0.
+    # First-block collapse is exact only for an L-constant tangent basis;
+    # token-varying bases take the general norm-JVP path. Detect before contiguous().
     l_const = (region_input_tangent_basis.shape[2] == 1
                or region_input_tangent_basis.stride(2) == 0)
-    collapse_first = (os.environ.get("LBI_FWDMODE_BCAST", "1") != "0") and l_const
+    collapse_first = l_const
 
-    # Cache-fed mode reads every primal operating point from the region
-    # forward's caches; the recompute path below rebuilds the primal chain.
-    layer_caches = getattr(cache, "layer_caches", None)
-    cache_fed = (layer_caches is not None
-                 and len(layer_caches) == end - start
-                 and os.environ.get("LBI_FWDMODE_CACHEPRE", "1") != "0")
+    layer_caches = cache.layer_caches
+    if len(layer_caches) != end - start:
+        raise ValueError("transformer forward-mode kernel path needs the region forward's layer caches")
 
-    s = int(tangent_token_start) if cache_fed else 0
+    s = int(tangent_token_start)
     full_len = region_input_tangent_basis.shape[2]
     if s > 0 and (l_const or s >= full_len):
         s = 0
     basis = region_input_tangent_basis[:, :, s:] if s else region_input_tangent_basis
     t = basis.movedim(1, 0).to(compute_dtype).contiguous()
 
-    if cache_fed:
-        cuda_attn_fn = _resolve_cuda_attn_jvp()
-        chain = _cache_fed_tangent_chain
-        if os.environ.get("LBI_FWDMODE_COMPILE", "0") != "0":
-            key = (start, end, tuple(t.shape), bool(pooled), s,
-                   cuda_attn_fn is not None)
-            chain = _COMPILED_CHAINS.get(key)
-            if chain is None:
-                chain = torch.compile(_cache_fed_tangent_chain, dynamic=False)
-                _COMPILED_CHAINS[key] = chain
-        dout = chain(backend, layer_caches, start, end, t, collapse_first,
-                     compute_dtype, pooled, cuda_attn_fn, s)
-        dout = dout.movedim(0, 1)
-        if s and not pooled:
-            full = torch.zeros(
-                dout.shape[0], dout.shape[1], full_len, dout.shape[3],
-                device=dout.device, dtype=dout.dtype)
-            full[:, :, s:] = dout
-            return full
-        return dout
-
-    h, dh = x.to(compute_dtype), t
-    res = dres = None
-    for i, layer_index in enumerate(range(start, end)):
-        blk = backend.backbone.blocks[layer_index]
-        attn = blk.attn
-        hd = attn.head_dim
-        L = h.shape[-2]
-        res = h + res if res is not None else h
-        dres = dh + dres if dres is not None else dh
-        if i == 0 and collapse_first and attn.in_proj.bias is None:
-            qkv = attn.in_proj(blk.norm(res))
-            synth = _norm_collapse_terms(blk.norm, attn.in_proj, res, dres)
-            dqkv = None
-        else:
-            nh, dnh = rmsnorm_jvp(res.contiguous(), dres.contiguous(),
-                                  blk.norm.weight, blk.norm.eps)
-            qkv, dqkv = _linear_jvp(attn.in_proj, nh, dnh)
-            synth = None
-        cos, sin = _rope_tables(L, hd // 2, attn.rope_base, qkv.device)
-        conv_w = attn.conv1d.weight.view(-1, attn.d_conv)
-        q, k, v, dq, dk, dv = fused_qkv_prep(
-            qkv.contiguous(), None if dqkv is None else dqkv.contiguous(),
-            synth, conv_w, attn.conv1d.bias, cos, sin,
-            attn.n_heads, attn.n_kv_heads, hd)
-        scale = softmax_scale(attn)
-        o, do = flash_attention_jvp(q, k, v, dq, dk, dv, scale)
-        o = o.transpose(-3, -2).flatten(-2)
-        do = do.transpose(-3, -2).flatten(-2)
-        h, dh = _linear_jvp(attn.out_proj, o, do)
-        res, dres = h + res, dh + dres
-        nh, dnh = rmsnorm_jvp(res.contiguous(), dres.contiguous(),
-                              blk.norm2.weight, blk.norm2.eps)
-        h, dh = _mlp_jvp(blk.mlp, nh, dnh)
-    dout = dh + dres
-    if pooled:
-        dout = dout.mean(dim=2, keepdim=True)
-    return dout.movedim(0, 1)
+    cuda_attn_fn = _resolve_cuda_attn_jvp()
+    dout = _cache_fed_tangent_chain_fused(backend, layer_caches, start, end, t,
+                                          collapse_first, compute_dtype, pooled,
+                                          cuda_attn_fn, s)
+    dout = dout.movedim(0, 1)
+    if s and not pooled:
+        full = torch.zeros(
+            dout.shape[0], dout.shape[1], full_len, dout.shape[3],
+            device=dout.device, dtype=dout.dtype)
+        full[:, :, s:] = dout
+        return full
+    return dout

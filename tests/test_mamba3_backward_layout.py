@@ -1,18 +1,15 @@
-"""Layout-invariance regression for the registered Mamba-3 SISO backward.
-
-The mixer feeds `mamba3_siso_combined` transpose views (ADT/DT/Trap), an expand
-view (Angles), and slice views (Q/K/V/Z of the in_proj output). The op's
-backward Triton kernels assume packed layouts on the tensors saved for
-backward; before the contiguous-ization fix in `_Mamba3Function.forward`, the
-view-fed backward silently corrupted every gradient except dV/dZ (u-space
-cos ~0.88 at dev shape). Gradients must be layout-invariant: feeding views and
-feeding contiguous copies of the same values must agree.
-"""
+"""Layout invariance of the registered Mamba-3 SISO backward. The mixer feeds
+`mamba3_siso_combined` transposed, expanded, and sliced views, and the backward
+Triton kernels assume packed layouts on the tensors saved for backward, which
+`_Mamba3Function.forward` makes contiguous. Feeding views and feeding
+contiguous copies of the same values must give the same gradients."""
 
 from __future__ import annotations
 
 import pytest
 import torch
+
+from tests.helpers import cos_rel
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -26,14 +23,12 @@ def test_siso_combined_backward_is_layout_invariant() -> None:
     bsz, seqlen, heads, hd, n_state = 2, 128, 4, 64, 64
     chunk = 64
 
-    # Leaves in PRE-view layouts, mirroring the mixer graph: slices of a wider
-    # buffer (Q/K/V/Z), [B,S,H]->[B,H,S] transposes (ADT/DT/Trap), and a
-    # head-expand (Angles).
+    # Leaves in pre-view layouts mirroring the mixer graph: wide-buffer slices,
+    # transposes, and a head-expand.
     q_base = torch.randn(bsz, seqlen, 1, n_state + 8, device=dev, dtype=dt, requires_grad=True)
     k_base = torch.randn(bsz, seqlen, 1, n_state + 8, device=dev, dtype=dt, requires_grad=True)
-    # V/Z replicate the in_proj packing exactly: a slice of a WIDER [B,S,W]
-    # buffer reshaped to [B,S,H,hd] -- seq stride W != H*hd is the proven
-    # corruption trigger (head/feature dims stay packed).
+    # V/Z replicate the in_proj packing: a wider-buffer slice whose seq stride
+    # W != H*hd is the proven corruption trigger.
     vz_width = 2 * heads * hd + 12
     vz_base = torch.randn(bsz, seqlen, vz_width, device=dev, dtype=dt, requires_grad=True)
     adt_base = -torch.rand(bsz, seqlen, heads, device=dev, dtype=torch.float32, requires_grad=True)
@@ -74,10 +69,8 @@ def test_siso_combined_backward_is_layout_invariant() -> None:
     grads_cont = run(True)
     names = ("Q", "K", "VZ", "ADT", "DT", "Trap", "Angles")
     for name, gv, gc in zip(names, grads_views, grads_cont):
-        a, b = gv.float().flatten(), gc.float().flatten()
-        cos = torch.nn.functional.cosine_similarity(a, b, dim=0).item()
-        rel = ((a - b).abs().max() / (b.abs().max() + 1e-9)).item()
+        cos, rel = cos_rel(gv, gc)
         assert cos > 0.9999 and rel < 1e-2, (
             f"{name}: view-fed backward diverges from contiguous-fed "
-            f"(cos {cos:.4f}, rel {rel:.3e}) -- stride regression in the saved-tensor path"
+            f"(cos {cos:.4f}, rel {rel:.3e}): stride regression in the saved-tensor path"
         )

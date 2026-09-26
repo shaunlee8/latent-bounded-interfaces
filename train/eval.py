@@ -10,16 +10,9 @@ import torch.nn.functional as F
 
 
 def next_token_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Mean next-token cross-entropy over every position."""
     vocab = logits.size(-1)
     return F.cross_entropy(logits.float().reshape(-1, vocab), targets.reshape(-1), reduction="mean")
-
-
-def resolve_eval_message_ablation_modes(cfg: Any, *, ablation_modes: tuple[str, ...]) -> list[str]:
-    if cfg.eval_all_message_ablations:
-        return list(ablation_modes)
-    if cfg.eval_message_ablation == "none":
-        return []
-    return [cfg.eval_message_ablation]
 
 
 def evaluate_reference(
@@ -33,7 +26,7 @@ def evaluate_reference(
     sample_batch_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]],
     autocast_context_fn: Callable[[Any, torch.device], AbstractContextManager[Any]],
 ) -> dict[str, float]:
-    """Online/post-hoc CE evaluator for dense backprop_ref runs."""
+    """Validation cross-entropy of the dense model."""
     model.eval()
     losses: list[float] = []
     with torch.no_grad():
@@ -61,10 +54,8 @@ def evaluate_native(
     device: torch.device,
     sample_batch_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]],
     autocast_context_fn: Callable[[Any, torch.device], AbstractContextManager[Any]],
-    message_ablation: str = "none",
-    ablation_generator: torch.Generator | None = None,
 ) -> dict[str, float]:
-    """Online/post-hoc CE evaluator for LBI runs, with optional message ablations."""
+    """Validation cross-entropy of the LBI model."""
     model.eval()
     losses: list[float] = []
     with torch.no_grad():
@@ -77,12 +68,6 @@ def evaluate_native(
                 device=device,
             )
             with autocast_context_fn(cfg, device):
-                logits, _ = model.forward_with_cache(
-                    xb,
-                    message_ablation=message_ablation,
-                    message_noise_std=cfg.message_noise_std,
-                    message_mask_keep_prob=cfg.message_mask_keep_prob,
-                    ablation_generator=ablation_generator,
-                )
+                logits, _ = model.forward_with_cache(xb)
             losses.append(float(next_token_loss(logits, yb).item()))
     return {"ce_loss": float(sum(losses) / max(1, len(losses)))}

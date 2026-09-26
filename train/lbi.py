@@ -1,3 +1,6 @@
+"""Training entrypoint for the dense and LBI variants; each variant writes to
+its own subdirectory of the run root."""
+
 from __future__ import annotations
 
 import json
@@ -6,7 +9,6 @@ from pathlib import Path
 import time
 from typing import Any, Dict
 
-from backward import autograd_backward_step as _autograd_backward_step
 from train.checkpointing import infer_existing_root_dir as _infer_existing_root_dir
 from train.config import (
     DENSE_VARIANT,
@@ -18,18 +20,7 @@ from train.config import (
     resolve_model_variants,
 )
 from train.data import resolve_runtime_vocab_size as _resolve_runtime_vocab_size
-from train.eval import next_token_loss as _next_token_loss
-from train.runners import (
-    _autocast_context,
-    _resolve_device,
-    run_dense_training,
-    run_lbi_training,
-)
-
-
-# Training entrypoint for dense and LBI model variants.
-# Runs are selected by model variants and written to dense/ and lbi/ subdirectories.
-
+from train.runners import run_dense_training, run_lbi_training
 
 
 def _prepare_run_dir(cfg: LBITrainingConfig, run_root_name: str) -> Path:
@@ -39,8 +30,6 @@ def _prepare_run_dir(cfg: LBITrainingConfig, run_root_name: str) -> Path:
     out = root / base
     out.mkdir(parents=True, exist_ok=True)
     return out
-
-
 
 
 def _root_name_for_variants(variants: tuple[str, ...]) -> str:
@@ -70,10 +59,6 @@ def run_lbi_experiment(cfg: LBITrainingConfig) -> Dict[str, Any]:
     summary = {"variants": list(variants), "root_dir": str(root_dir), "runs": runs}
     (root_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     return summary
-
-
-# Public alias used by script entrypoints.
-run_training = run_lbi_experiment
 
 
 def main() -> None:

@@ -1,11 +1,11 @@
 """Triton kernels for the r-batched transformer region JVP.
 
 `_flash_attention_jvp` runs one flash pass computing the primal and up to
-four tangent lanes with shared Q/K/V tiles and softmax statistics;
+four tangent directions with shared Q/K/V tiles and softmax statistics;
 `_fused_qkv_prep` fuses (tangent synthesis | load) -> causal conv taps ->
-half-split rope -> head-layout stores for the primal and all lanes;
-`_rmsnorm_jvp_row` computes the RMSNorm primal + r-lane tangent one token
-row per program, reading each row and lane once.
+half-split rope -> head-layout stores for the primal and all directions;
+`_rmsnorm_jvp_row` computes the RMSNorm primal + r-direction tangent one token
+row per program, reading each row and direction once.
 """
 from __future__ import annotations
 
@@ -39,16 +39,13 @@ def _flash_attention_jvp(Qp, Kp, Vp, DQp, DKp, DVp, Op, DOp,
                          Lctx, DL, QS, lane_str,
                          SCALE: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
                          HD: tl.constexpr, R: tl.constexpr):
-    """Causal flash attention with R tangent lanes riding one KV pass.
-
-    dO = (sum(p*dS) V + sum(p) dV - rowsum(p*dS) * O) / l with the online
-    rescale corrections; softmax shift invariance keeps the running-max term
-    exact. Per-lane accumulators are unrolled (R is constexpr, R <= 4).
-
-    QS/DL: query-suffix mode. Q/K/V are full-length [.., Lctx, HD]; the
-    tangents and outputs cover only the DL = Lctx - QS suffix rows (exact when
-    the tangent stream is zero before QS — the strict chunk-causal decode).
-    QS = 0, DL = Lctx is the square causal case."""
+    """Causal flash attention with R tangent directions riding one KV pass:
+        dO = (sum(p*dS) V + sum(p) dV - rowsum(p*dS) * O) / l with the online
+        rescale corrections, the per-direction accumulators unrolled (R is
+        constexpr, R <= 4). QS/DL select the query-suffix mode, where Q/K/V are
+        full length while the tangents and outputs cover the DL = Lctx - QS suffix
+        rows, exact when the tangent stream is zero before QS; QS = 0, DL = Lctx
+        is the square causal case."""
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
     base = pid_bh.to(tl.int64) * Lctx * HD
@@ -162,12 +159,12 @@ def _fused_qkv_prep(
     R: tl.constexpr, SYNTH: tl.constexpr, ROPE: tl.constexpr, BL: tl.constexpr,
     HASBIAS: tl.constexpr, EMIT_PRIMAL: tl.constexpr,
 ):
-    """One (batch, stream, head, L-tile) program: conv taps + rope + head
-    split for the primal and all R lanes, stored directly as [B,H,L,HD] /
-    [r,B,H,L,HD]. Conv taps are per-tap masked loads; consecutive taps shift
-    by one row so L1 absorbs the re-reads. Halo rows below zero are masked
-    (constant pad). SYNTH: lanes are built in-registers from per-token
-    scalars (S, A) and a per-lane row U instead of loading DQKV."""
+    """One (batch, stream, head, L-tile) program: conv taps, rope, and head
+        split for the primal and all R directions, stored directly as [B,H,L,HD]
+        and [r,B,H,L,HD]. Conv taps are per-tap masked loads shifted by one row so
+        L1 absorbs the re-reads, with the rows below zero masked to the constant
+        pad. SYNTH builds the directions in registers from per-token scalars
+        (S, A) and a per-direction row U instead of loading DQKV."""
     HALF: tl.constexpr = HD // 2
     pid_l = tl.program_id(0)
     pid_bh = tl.program_id(1)
@@ -260,7 +257,7 @@ def _fused_qkv_prep(
 
 def fused_qkv_prep(qkv, dqkv, synth, conv_w, conv_b, cos, sin,
                    n_heads, n_kv_heads, hd, BL=64, warps=4, emit_primal=True):
-    """Fused conv + rope + head split for the primal and all tangent lanes.
+    """Fused conv + rope + head split for the primal and all tangent directions.
 
     qkv   [B, L, D3] bf16 (post in_proj, pre conv)
     dqkv  [r, B, L, D3] bf16, or None with `synth`
@@ -337,3 +334,45 @@ def rmsnorm_jvp(x, t, weight, eps, warps=8, emit_y=True):
                                B * L, eps, D=d, R=r, EMIT_Y=emit_y,
                                num_warps=warps)
     return y, dy
+
+
+@triton.jit
+def _swiglu_jvp_row(GATE, UP, ACT, DH1, OUT, NROW,
+                    H: tl.constexpr, R: tl.constexpr, BLOCK: tl.constexpr):
+    # One program per primal row: reads gate/up/act once, then every
+    # direction's (dup, dgate) halves of the fc1 tangent row [.., 2H]
+    # (up half first, gate half second, matching dh1.chunk(2, dim=-1)).
+    pid = tl.program_id(0)
+    for h0 in tl.static_range(0, H, BLOCK):
+        offs = h0 + tl.arange(0, BLOCK)
+        g = tl.load(GATE + pid * H + offs).to(tl.float32)
+        u = tl.load(UP + pid * H + offs).to(tl.float32)
+        a = tl.load(ACT + pid * H + offs).to(tl.float32)
+        sg = tl.sigmoid(g)
+        dsilu = sg * (1 + g * (1 - sg))
+        for j in tl.static_range(R):
+            row = (j * NROW + pid) * (2 * H)
+            dup = tl.load(DH1 + row + offs).to(tl.float32)
+            dgate = tl.load(DH1 + row + H + offs).to(tl.float32)
+            out = dup * a + u * dsilu * dgate
+            tl.store(OUT + (j * NROW + pid) * H + offs, out.to(OUT.dtype.element_ty))
+
+
+def swiglu_jvp(gate, up, activation, dh1, warps=None):
+    """Fused tangent of up * silu(gate): gate/up/activation [B,L,H] (the
+    cached primal operating point, activation = silu(gate)), dh1 [r,B,L,2H]
+    contiguous (the fc1 tangent; its two halves are dup, dgate). Returns
+    dmid [r,B,L,H] in dh1's dtype; one pass over the tangent instead of the
+    four of the unfused expression. H must be a multiple of 512."""
+    B, L, H = gate.shape
+    r = dh1.shape[0]
+    assert dh1.shape[-1] == 2 * H and dh1.is_contiguous() and H % 512 == 0
+    # Widest power-of-two block dividing H: one row per program at H=4096
+    # with 16 warps runs ~2.4x faster than 512-wide chunks with 8 warps.
+    block = next(b for b in (4096, 2048, 1024, 512) if H % b == 0)
+    if warps is None:
+        warps = 16 if block >= 2048 else 4
+    out = torch.empty((r, B, L, H), device=dh1.device, dtype=dh1.dtype)
+    _swiglu_jvp_row[(B * L,)](gate.contiguous(), up.contiguous(), activation.contiguous(),
+                              dh1, out, B * L, H=H, R=r, BLOCK=block, num_warps=warps)
+    return out

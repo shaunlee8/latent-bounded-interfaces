@@ -27,9 +27,3 @@ class GatedMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y, gate = self.fc1(x).chunk(2, dim=-1)
         return self.fc2(y * F.silu(gate))
-
-
-class SwiGLUMLP(GatedMLP):
-    def __init__(self, dim: int, mlp_ratio: float = 4.0, bias: bool = False) -> None:
-        hidden_dim = max(1, int(dim * mlp_ratio))
-        super().__init__(dim, hidden_features=hidden_dim, out_features=dim, bias=bias, multiple_of=1)

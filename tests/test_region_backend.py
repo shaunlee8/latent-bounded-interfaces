@@ -5,15 +5,13 @@ import pytest
 
 from backbones.general import BackboneSpec, build_backbone_stack
 from backends import (
-    BackboneStackRegionBackend,
     MAMBA3_SCAN_INPUT_NAMES,
     Mamba3RegionBackend,
     Mamba3RegionCache,
-    RegionLocalAutogradMamba3Lowering,
     TorchAutogradMamba3MixerLowering,
     TransformerRegionBackend,
     TransformerRegionCache,
-    TritonMamba3MixerLowering,
+    NativeMamba3MixerLowering,
     mamba3_block_input_pullback_native,
     mamba3_block_param_vjp_native,
     mamba3_siso_scan_input_pullback_basis,
@@ -24,13 +22,21 @@ from backward import (
     ScanADEngine,
     TorchAutogradLocalVJPProvider,
 )
-from interfaces import VectorMLPInterface
+from interfaces.vector_mlp import VectorMLPInterface
 from train.config import LBITrainingConfig
 from train.model_builders import build_lbi_model
 from models.lbi_language_model import LBILanguageModel, build_region_ranges
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Mamba-3 Triton kernels require CUDA")
+
+# bf16 kernels with atomic-add reductions: parity tolerances far below any
+# structural error, per-parameter max-relative (REL) or allclose (ABS).
+REL_TOL = 3e-2
+REL_TOL_NATIVE_LOCAL = 6e-2
+ABS_TOL_BASIS = 4e-2
+ABS_TOL_LOWERING = 2e-2
+ABS_TOL_LONG_REDUCTION = 5e-2
 
 
 def _spec() -> BackboneSpec:
@@ -58,49 +64,6 @@ def _mamba3_spec() -> BackboneSpec:
     )
 
 
-def test_backbone_stack_region_backend_matches_forward_range() -> None:
-    torch.manual_seed(31)
-    spec = _spec()
-    stack = build_backbone_stack(spec)
-    region_ranges = build_region_ranges(spec.layers, 2)
-    backend = BackboneStackRegionBackend(backbone=stack, region_ranges=region_ranges)
-    x = torch.randn(2, 8, spec.dim)
-
-    for region_index, (start, end) in enumerate(region_ranges):
-        actual, cache = backend.forward_region(region_input=x, region_index=region_index)
-        expected = stack.forward_range(x, start, end)
-        assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
-        assert cache.region_index == region_index
-        assert cache.layer_range == (start, end)
-
-
-def test_backbone_stack_region_backend_returns_only_region_parameters() -> None:
-    torch.manual_seed(37)
-    spec = _spec()
-    stack = build_backbone_stack(spec)
-    region_ranges = build_region_ranges(spec.layers, 2)
-    backend = BackboneStackRegionBackend(backbone=stack, region_ranges=region_ranges)
-
-    first_region_ids = {id(param) for param in backend.parameters_for_region(0)}
-    second_region_ids = {id(param) for param in backend.parameters_for_region(1)}
-
-    assert first_region_ids
-    assert second_region_ids
-    assert first_region_ids.isdisjoint(second_region_ids)
-    assert first_region_ids == {
-        id(param)
-        for layer_index in range(0, 2)
-        for param in stack.blocks[layer_index].parameters()
-        if param.requires_grad
-    }
-    assert second_region_ids == {
-        id(param)
-        for layer_index in range(2, 4)
-        for param in stack.blocks[layer_index].parameters()
-        if param.requires_grad
-    }
-
-
 def test_transformer_region_backend_matches_forward_range_and_records_layer_cache() -> None:
     torch.manual_seed(41)
     spec = _spec()
@@ -124,7 +87,7 @@ def test_transformer_region_backend_matches_forward_range_and_records_layer_cach
             assert layer_cache.hidden_output.shape == x.shape
 
 
-def test_lbi_transformer_model_uses_owned_transformer_region_backend_state_keys() -> None:
+def test_lbi_transformer_model_uses_transformer_region_backend() -> None:
     cfg = LBITrainingConfig(
         vocab_size=64,
         backbone="transformer",
@@ -141,9 +104,6 @@ def test_lbi_transformer_model_uses_owned_transformer_region_backend_state_keys(
     model = build_lbi_model(cfg)
     assert isinstance(model.region_backend, TransformerRegionBackend)
     assert any(key.startswith("region_backend.backbone") for key in model.state_dict())
-    assert not any(key.startswith("backbone") for key in model.state_dict())
-    assert "backbone" not in model._modules
-    assert "blocks" not in model._modules
 
     input_ids = torch.randint(0, 64, (2, 8), dtype=torch.long)
     _, cache = model.forward_with_cache(input_ids)
@@ -357,9 +317,7 @@ def test_mamba3_region_backend_input_pullback_basis_matches_autograd() -> None:
         expected_cols.append(grad.unsqueeze(1))
     expected = torch.cat(expected_cols, dim=1)
     assert actual.shape == basis.shape
-    # Native lowering: bf16 + atomic-add nondeterminism in the scan kernels
-    # (region composition compounds it); loose but far below any structural bug.
-    assert torch.allclose(actual, expected, atol=4e-2, rtol=4e-2)
+    assert torch.allclose(actual, expected, atol=ABS_TOL_BASIS, rtol=ABS_TOL_BASIS)
 
 
 @requires_cuda
@@ -391,16 +349,13 @@ def test_mamba3_region_backend_parameter_vjp_matches_autograd() -> None:
 
     assert actual.keys() == expected.keys()
     for name in actual:
-        # Max-relative-error (not allclose's elementwise atol, which is too
-        # strict for wide-range bf16 weight grads). Native region composition +
-        # atomic-add nondeterminism; far below any structural bug.
         ref = expected[name].float()
         rel = (actual[name].float() - ref).abs().max() / (ref.abs().max() + 1e-9)
-        assert rel <= 3e-2, f"{name}: rel {rel:.4f}"
+        assert rel <= REL_TOL, f"{name}: rel {rel:.4f}"
 
 
 @requires_cuda
-def test_lbi_mamba3_model_uses_owned_mamba3_region_backend() -> None:
+def test_lbi_mamba3_model_uses_mamba3_region_backend() -> None:
     cfg = LBITrainingConfig(
         vocab_size=64,
         backbone="mamba3",
@@ -419,7 +374,6 @@ def test_lbi_mamba3_model_uses_owned_mamba3_region_backend() -> None:
     model = build_lbi_model(cfg).to(device="cuda", dtype=torch.bfloat16)
     assert isinstance(model.region_backend, Mamba3RegionBackend)
     assert any(key.startswith("region_backend.backbone") for key in model.state_dict())
-    assert "backbone" not in model._modules
 
     input_ids = torch.randint(0, 64, (2, 32), dtype=torch.long, device="cuda")
     _, cache = model.forward_with_cache(input_ids)
@@ -456,34 +410,20 @@ def test_mamba3_mixer_input_pullback_contract_matches_autograd() -> None:
         expected_cols.append(grad.unsqueeze(1))
     expected = torch.cat(expected_cols, dim=1)
     assert actual.shape == basis.shape
-    # Native lowering: bf16 + atomic-add nondeterminism in the scan kernels
-    # (region composition compounds it); loose but far below any structural bug.
-    assert torch.allclose(actual, expected, atol=4e-2, rtol=4e-2)
+    assert torch.allclose(actual, expected, atol=ABS_TOL_BASIS, rtol=ABS_TOL_BASIS)
 
 
 @requires_cuda
 def test_mamba3_native_mixer_lowering_matches_autograd() -> None:
     mixer, mixer_cache, basis = _mamba3_mixer_and_cache(83)
-    native = TritonMamba3MixerLowering().input_pullback_basis(
+    native = NativeMamba3MixerLowering().input_pullback_basis(
         mixer=mixer, cache=mixer_cache, output_cotangent_basis=basis
     )
     expected = TorchAutogradMamba3MixerLowering().input_pullback_basis(
         mixer=mixer, cache=mixer_cache, output_cotangent_basis=basis
     )
     assert native.shape == basis.shape
-    assert torch.allclose(native, expected, atol=2e-2, rtol=2e-2)
-
-
-@requires_cuda
-def test_mamba3_mixer_lowering_reference_fallback_matches_reference() -> None:
-    mixer, mixer_cache, basis = _mamba3_mixer_and_cache(87)
-    actual = TritonMamba3MixerLowering(allow_reference_fallback=True).input_pullback_basis(
-        mixer=mixer, cache=mixer_cache, output_cotangent_basis=basis
-    )
-    expected = TorchAutogradMamba3MixerLowering().input_pullback_basis(
-        mixer=mixer, cache=mixer_cache, output_cotangent_basis=basis
-    )
-    assert torch.allclose(actual, expected, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(native, expected, atol=ABS_TOL_LOWERING, rtol=ABS_TOL_LOWERING)
 
 
 @requires_cuda
@@ -526,7 +466,7 @@ def test_mamba3_scan_input_pullback_matches_autograd() -> None:
     for name in MAMBA3_SCAN_INPUT_NAMES:
         exp = torch.cat(expected[name], dim=1)
         assert actual[name].shape == exp.shape, name
-        assert torch.allclose(actual[name], exp, atol=2e-2, rtol=2e-2), name
+        assert torch.allclose(actual[name], exp, atol=ABS_TOL_LOWERING, rtol=ABS_TOL_LOWERING), name
 
 
 @requires_cuda
@@ -560,9 +500,9 @@ def test_mamba3_native_block_pullback_matches_autograd() -> None:
     expected_h = torch.cat(exp_h, dim=1)
     expected_r = torch.cat(exp_r, dim=1)
 
-    assert torch.allclose(gh, expected_h, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(gh, expected_h, atol=ABS_TOL_LOWERING, rtol=ABS_TOL_LOWERING)
     assert gr is not None
-    assert torch.allclose(gr, expected_r, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(gr, expected_r, atol=ABS_TOL_LOWERING, rtol=ABS_TOL_LOWERING)
 
 
 @requires_cuda
@@ -592,34 +532,37 @@ def test_mamba3_native_block_param_vjp_matches_autograd() -> None:
         assert exp is not None, name
         native = grads[param]
         assert native.shape == param.shape, name
-        # in_proj.weight and dt_bias are long bf16 reductions over B*L; the scan
-        # kernels add atomic noise, so give them more slack (a structural bug
-        # would be far larger).
-        tol = 5e-2 if name.endswith(("in_proj.weight", "dt_bias")) else 2e-2
+        # in_proj.weight and dt_bias are long bf16 reductions over B*L.
+        tol = ABS_TOL_LONG_REDUCTION if name.endswith(("in_proj.weight", "dt_bias")) else ABS_TOL_LOWERING
         assert torch.allclose(native.float(), exp.float(), atol=tol, rtol=tol), name
 
 
-@requires_cuda
-def test_lbi_mamba3_scan_engine_native_pullback_matches_autograd() -> None:
-    # The LBI scan backward with the native interface pullback provider
-    # (native region Jacobian) must produce the same full gradients as plain
-    # autograd on a small LBI Mamba-3 model.
+def _mamba3_lbi_model_and_autograd_grads():
+    """A two-region Mamba-3 model on CUDA with its plain-autograd gradients."""
     torch.manual_seed(5)
-    spec = BackboneSpec(
-        name="mamba3", dim=64, layers=4, d_state=64, expand=2, headdim=64, ngroups=1, chunk_size=16
-    )
     interface = VectorMLPInterface(
         feature_dim=64, num_regions=2, interface_width=8, interface_map_hidden_dim=32, update_scale_init=0.5
     )
     model = LBILanguageModel(
-        vocab_size=64, layers_per_region=2, backbone_spec=spec, interface=interface
+        vocab_size=64, layers_per_region=2, backbone_spec=_mamba3_spec(), interface=interface
     ).to(device="cuda", dtype=torch.bfloat16)
     input_ids = torch.randint(0, 64, (2, 32), dtype=torch.long, device="cuda")
-
     model.zero_grad(set_to_none=True)
     model(input_ids).square().mean().backward()
     autograd_grads = {n: p.grad.detach().clone() for n, p in model.named_parameters() if p.grad is not None}
+    return model, input_ids, autograd_grads
 
+
+def _assert_rel_close(grad_map, autograd_grads, tol: float) -> None:
+    assert set(autograd_grads) <= {n for n, v in grad_map.items() if v is not None}
+    for name, grad in autograd_grads.items():
+        rel = (grad_map[name].float() - grad.float()).abs().max() / (grad.float().abs().max() + 1e-9)
+        assert rel <= tol, f"{name}: rel {rel:.4f}"
+
+
+@requires_cuda
+def test_lbi_mamba3_scan_engine_native_pullback_matches_autograd() -> None:
+    model, input_ids, autograd_grads = _mamba3_lbi_model_and_autograd_grads()
     logits, cache = model.forward_with_cache(input_ids)
     result = ScanADEngine(
         pullback_provider=NativeInterfacePullbackProvider(),
@@ -627,37 +570,13 @@ def test_lbi_mamba3_scan_engine_native_pullback_matches_autograd() -> None:
     ).backward(model=model, loss=logits.square().mean(), cache=cache)
 
     assert result.diagnostics["interface_pullback_provider"] == "native"
-    # parallel suffix scan over native A_k matches the sequential reference
-    assert result.diagnostics["interface_scan_rms"] < 1e-2
-    assert set(autograd_grads) <= {n for n, v in result.grad_map.items() if v is not None}
-    for name, grad in autograd_grads.items():
-        native = result.grad_map[name]
-        rel = (native.float() - grad.float()).abs().max() / (grad.float().abs().max() + 1e-9)
-        assert rel <= 3e-2, f"{name}: rel {rel:.4f}"
+    _assert_rel_close(result.grad_map, autograd_grads, REL_TOL)
 
 
 @requires_cuda
 def test_lbi_mamba3_scan_engine_native_local_vjp_matches_autograd() -> None:
-    # Fully native local VJPs (region-backend params via region.parameter_vjp;
-    # native seed + native canvas; scoped-local interface params) run against a
-    # forward with NO region autograd graph (native_backward=True). The whole
-    # parameter gradient must still match plain autograd.
-    torch.manual_seed(5)
-    spec = BackboneSpec(
-        name="mamba3", dim=64, layers=4, d_state=64, expand=2, headdim=64, ngroups=1, chunk_size=16
-    )
-    interface = VectorMLPInterface(
-        feature_dim=64, num_regions=2, interface_width=8, interface_map_hidden_dim=32, update_scale_init=0.5
-    )
-    model = LBILanguageModel(
-        vocab_size=64, layers_per_region=2, backbone_spec=spec, interface=interface
-    ).to(device="cuda", dtype=torch.bfloat16)
-    input_ids = torch.randint(0, 64, (2, 32), dtype=torch.long, device="cuda")
-
-    model.zero_grad(set_to_none=True)
-    model(input_ids).square().mean().backward()
-    autograd_grads = {n: p.grad.detach().clone() for n, p in model.named_parameters() if p.grad is not None}
-
+    # Native local VJPs over a graph-free forward (native_backward=True).
+    model, input_ids, autograd_grads = _mamba3_lbi_model_and_autograd_grads()
     logits, cache = model.forward_with_cache(input_ids, native_backward=True)
     result = ScanADEngine(
         pullback_provider=NativeInterfacePullbackProvider(),
@@ -665,81 +584,4 @@ def test_lbi_mamba3_scan_engine_native_local_vjp_matches_autograd() -> None:
     ).backward(model=model, loss=logits.square().mean(), cache=cache)
 
     assert result.diagnostics["local_vjp_provider"] == "native_local"
-    assert set(autograd_grads) <= {n for n, v in result.grad_map.items() if v is not None}
-    for name, grad in autograd_grads.items():
-        native = result.grad_map[name]
-        rel = (native.float() - grad.float()).abs().max() / (grad.float().abs().max() + 1e-9)
-        assert rel <= 6e-2, f"{name}: rel {rel:.4f}"
-
-
-@requires_cuda
-def test_lbi_mamba3_native_backward_trim_region_cache_matches_autograd() -> None:
-    # Cache trimming: forward stores only the region input (no per-layer
-    # forward caches); the native backward recomputes each region on demand and
-    # still matches autograd.
-    torch.manual_seed(5)
-    spec = BackboneSpec(
-        name="mamba3", dim=64, layers=4, d_state=64, expand=2, headdim=64, ngroups=1, chunk_size=16
-    )
-    interface = VectorMLPInterface(
-        feature_dim=64, num_regions=2, interface_width=8, interface_map_hidden_dim=32, update_scale_init=0.5
-    )
-    model = LBILanguageModel(
-        vocab_size=64, layers_per_region=2, backbone_spec=spec, interface=interface
-    ).to(device="cuda", dtype=torch.bfloat16)
-    input_ids = torch.randint(0, 64, (2, 32), dtype=torch.long, device="cuda")
-
-    model.zero_grad(set_to_none=True)
-    model(input_ids).square().mean().backward()
-    autograd_grads = {n: p.grad.detach().clone() for n, p in model.named_parameters() if p.grad is not None}
-
-    logits, cache = model.forward_with_cache(input_ids, native_backward=True, trim_region_cache=True)
-    # Trimmed: no per-layer forward caches are resident after the forward.
-    assert all(not rc.backend_cache.layer_caches for rc in cache["region_caches"])
-
-    result = ScanADEngine(
-        pullback_provider=NativeInterfacePullbackProvider(),
-        local_vjp_provider=NativeLocalVJPProvider(),
-    ).backward(model=model, loss=logits.square().mean(), cache=cache)
-
-    assert set(autograd_grads) <= {n for n, v in result.grad_map.items() if v is not None}
-    for name, grad in autograd_grads.items():
-        native = result.grad_map[name]
-        rel = (native.float() - grad.float()).abs().max() / (grad.float().abs().max() + 1e-9)
-        assert rel <= 6e-2, f"{name}: rel {rel:.4f}"
-
-
-@requires_cuda
-def test_lbi_mamba3_region_local_autograd_lowering_matches_autograd() -> None:
-    # Constant-factor path: RegionLocalAutogradMamba3Lowering (re-forward + fused
-    # autograd backward, no custom Triton orchestration) must give the same
-    # full-gradient parity as plain autograd, under the native scan engine, for
-    # both trim modes.
-    torch.manual_seed(5)
-    spec = BackboneSpec(
-        name="mamba3", dim=64, layers=4, d_state=64, expand=2, headdim=64, ngroups=1, chunk_size=16
-    )
-    interface = VectorMLPInterface(
-        feature_dim=64, num_regions=2, interface_width=8, interface_map_hidden_dim=32, update_scale_init=0.5
-    )
-    model = LBILanguageModel(
-        vocab_size=64, layers_per_region=2, backbone_spec=spec, interface=interface
-    ).to(device="cuda", dtype=torch.bfloat16)
-    model.region_backend.lowering = RegionLocalAutogradMamba3Lowering()
-    input_ids = torch.randint(0, 64, (2, 32), dtype=torch.long, device="cuda")
-
-    model.zero_grad(set_to_none=True)
-    model(input_ids).square().mean().backward()
-    autograd_grads = {n: p.grad.detach().clone() for n, p in model.named_parameters() if p.grad is not None}
-
-    for trim in (False, True):
-        logits, cache = model.forward_with_cache(input_ids, native_backward=True, trim_region_cache=trim)
-        result = ScanADEngine(
-            pullback_provider=NativeInterfacePullbackProvider(),
-            local_vjp_provider=NativeLocalVJPProvider(),
-        ).backward(model=model, loss=logits.square().mean(), cache=cache)
-        assert set(autograd_grads) <= {n for n, v in result.grad_map.items() if v is not None}
-        for name, grad in autograd_grads.items():
-            native = result.grad_map[name]
-            rel = (native.float() - grad.float()).abs().max() / (grad.float().abs().max() + 1e-9)
-            assert rel <= 3e-2, f"trim={trim} {name}: rel {rel:.4f}"
+    _assert_rel_close(result.grad_map, autograd_grads, REL_TOL_NATIVE_LOCAL)

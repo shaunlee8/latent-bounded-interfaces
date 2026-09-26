@@ -362,16 +362,12 @@ class TransformerRegionBackend(nn.Module):
         output_cotangent: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """Parameter grads and the region-input cotangent from one reverse
-        walk over the cached activations, without replaying the region
-        forward. Falls back to the autograd lowering outside the native
-        contract or when LBI_TRANSFORMER_NATIVE_VJP=0."""
-        import os
-
+        sweep over the cached activations, without replaying the region
+        forward. Falls back to the autograd lowering outside the native contract."""
         from backends.transformer_native_vjp import (
             native_vjp_supported, transformer_region_parameter_vjp)
 
-        if (os.environ.get("LBI_TRANSFORMER_NATIVE_VJP", "1") != "0"
-                and native_vjp_supported(self, cache)):
+        if native_vjp_supported(self, cache):
             return transformer_region_parameter_vjp(self, cache, output_cotangent)
         grads = self.lowering.parameter_vjp(
             backend=self, cache=cache, output_cotangent=output_cotangent)
@@ -387,50 +383,20 @@ class TransformerRegionBackend(nn.Module):
         region_input_tangent_basis: torch.Tensor,
         compute_dtype: torch.dtype | None = None,
         pooled: bool = False,
-        output_projection: torch.Tensor | None = None,
-        output_inner: torch.Tensor | None = None,
         tangent_token_start: int = 0,
     ) -> torch.Tensor:
         """Push a region-input tangent basis [B, P, L, D] to the region-output
-        tangent basis at the frozen operating point (the dual of
-        `input_pullback_basis`). `forward_mode_use_kernel` selects the fused
-        kernels over the torch.func reference; `pooled` returns the mean over
-        L with keepdim; `output_projection`/`output_inner` return the projected
-        tangent contraction for token-wise interfaces; `compute_dtype=None`
-        resolves to bf16 on the kernel path (LBI_FWDMODE_CD=float32 escapes)
-        and fp32 on the reference.
-
-        `tangent_token_start`: caller-certified first token with nonzero
-        tangent (strict chunk-causal decodes). The cache-fed kernel chain and
-        the projection epilogue restrict compute to the suffix; other paths
-        ignore it (full compute, equally exact)."""
-        if output_projection is not None:
-            if pooled:
-                raise ValueError("pooled and output_projection are mutually exclusive")
-            from backends.tangent_projection import lane_chunked_projection
-
-            return lane_chunked_projection(
-                lambda basis: self.region_output_jvp(
-                    cache=cache, region_input_tangent_basis=basis,
-                    compute_dtype=compute_dtype,
-                    tangent_token_start=tangent_token_start,
-                ),
-                region_input_tangent_basis,
-                output_projection=output_projection,
-                output_inner=output_inner,
-                tangent_token_start=tangent_token_start,
-            )
+        tangent basis at the frozen operating point, the dual of `input_pullback_basis`.
+        `forward_mode_use_kernel` selects the fused kernels (bf16) over the torch.func
+        reference (fp32) and `pooled` returns the mean over L. `tangent_token_start`
+        is the first token with a nonzero tangent; the kernel chain computes only that suffix."""
         if getattr(self, "forward_mode_use_kernel", False):
             from backends.transformer_forward_mode import (
                 transformer_region_output_jvp_kernel,
             )
 
             if compute_dtype is None:
-                import os
-
-                compute_dtype = (torch.float32
-                                 if os.environ.get("LBI_FWDMODE_CD") == "float32"
-                                 else torch.bfloat16)
+                compute_dtype = torch.bfloat16
             return transformer_region_output_jvp_kernel(
                 self,
                 cache=cache,

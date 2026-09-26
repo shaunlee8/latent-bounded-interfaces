@@ -5,7 +5,6 @@ Copyright (c) 2025, Dao AI Lab, Goombalab
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -17,10 +16,8 @@ from backbones.mamba3.ops.triton.mamba3.mamba3_siso_fwd import mamba3_siso_fwd
 from backbones.mamba3.ops.triton.mamba3.mamba3_siso_bwd import compute_dzdo, compute_dqkv, compute_dqktheta, compute_ddt_dtrap_dinput_states
 from backbones.mamba3.ops.triton.mamba3.angle_dt import angle_dt_fwd, angle_dt_bwd
 
-# forward-cache field reuse (backends/mamba3_forward_mode): when a caller
-# sets this to a dict around a forward call, the SISO Function stashes its
-# materialized intermediates (Q_rot, K_scaled, Scale, Angles_Cumsum) there --
-# the construction path consumes them instead of recomputing the same fields.
+# Forward-cache field reuse: with this set to a dict, the SISO Function
+# stashes its materialized intermediates for the construction path to consume.
 LBI_CAPTURE_SINK: "dict | None" = None
 
 
@@ -35,23 +32,6 @@ try:
 except Exception:
     pass  # Allocator may already be set
 
-
-@dataclass(frozen=True)
-class Mamba3Output:
-    """Container for Mamba-3 outputs and optional intermediates.
-    
-    Attributes:
-        out: Main output tensor (batch, seqlen, nheads, headdim_v)
-        final_angle_state: Final angle state (num_sequences, nheads, headdim_angles)
-        final_ssm_state: Final SSM state (num_sequences, nheads, headdim_v, headdim_qk)
-        final_k_state: Final K state (num_sequences, nheads, headdim_qk)
-        final_v_state: Final V state (num_sequences, nheads, headdim_v)
-    """
-    out: Tensor
-    final_angle_state: Optional[Tensor] = None
-    final_ssm_state: Optional[Tensor] = None
-    final_k_state: Optional[Tensor] = None
-    final_v_state: Optional[Tensor] = None
 
 class _Mamba3Function(torch.autograd.Function):
     """Custom autograd function for Mamba-3 with Triton kernels."""
@@ -90,10 +70,8 @@ class _Mamba3Function(torch.autograd.Function):
         capture = LBI_CAPTURE_SINK
 
         if needs_backward:
-            # The backward Triton kernels assume packed layouts on the tensors
-            # saved here; the mixer passes transpose (ADT/DT/Trap) and expand
-            # (Angles) views, which silently corrupt dQ/dK/dADT/dDT/dTrap/dAngles
-            # if saved as-is (forward kernels handle the strides correctly).
+            # Backward kernels assume packed layouts here; the mixer's transpose
+            # and expand views corrupt gradients if saved as-is.
             Q, K, V, ADT, DT, Trap = (t.contiguous() for t in (Q, K, V, ADT, DT, Trap))
             Q_bias, K_bias, Angles = (t.contiguous() for t in (Q_bias, K_bias, Angles))
             if Z is not None:
@@ -126,10 +104,8 @@ class _Mamba3Function(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
         )
         if capture is not None:
-            # forward-cache field reuse: hand the caller the materialized
-            # intermediates the construction path would otherwise recompute
-            # (zero extra compute; the stores above are forced on when
-            # autograd alone would not have made them).
+            # Field reuse: hand the caller the materialized intermediates the
+            # construction path would otherwise recompute.
             capture.update(q_rot=Q_rot, k_scaled=K_scaled, scale_s=Scale,
                            theta_cs=Angles_Cumsum)
 

@@ -19,9 +19,6 @@ class ADResult:
 @dataclass
 class LBIBackwardResult:
     grad_map: GradMap
-    interface_scan_rms: float
-    interface_jacobian_stats: dict[str, float] | None = None
-
 
 
 @runtime_checkable

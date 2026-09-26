@@ -1,11 +1,7 @@
-"""Transformer flash-JVP CUDA extension (Hopper sm_90a).
-
-`flash_jvp.cu` holds the lane-pair flash-JVP kernel family; the entry point
-is `flash_jvp_occ2_full` (occupancy-2, full-r loop, flat [B, L, H*hd]
-epilogue), wrapped as the custom op `lbi::flash_jvp` so compiled callers
-trace it as one graph node. JIT-builds on first use against tilelang's
-shipped wgmma headers; `build.sh` prewarms the build.
-"""
+"""Transformer flash-JVP CUDA extension (Hopper, sm_90a). The entry point
+`flash_jvp_occ2_full` runs all r directions with a flat [B, L, H*hd] epilogue
+and is wrapped as the custom op `lbi::flash_jvp`. It builds on first use
+against tilelang's shipped wgmma headers; `build.sh` prewarms the build."""
 from __future__ import annotations
 
 import functools
@@ -32,7 +28,8 @@ def _module():
             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__", "-U__CUDA_NO_BFLOAT16_OPERATORS__",
             "-U__CUDA_NO_BFLOAT162_OPERATORS__", "-U__CUDA_NO_HALF2_OPERATORS__",
         ],
-        extra_include_paths=[str(tl_dir / "src"),
+        extra_include_paths=[str(Path(__file__).resolve().parents[1] / "common"),
+                             str(tl_dir / "src"),
                              str(tl_dir / "3rdparty" / "cutlass" / "include")],
         verbose=False,
     )

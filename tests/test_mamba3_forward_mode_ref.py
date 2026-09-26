@@ -1,24 +1,20 @@
-"""Parity gates for the forward-mode (JVP) SISO scan primitive.
+"""Parity checks for the forward-mode (JVP) SISO scan reference.
 
-The forward-mode interface-Jacobian path needs a differentiable oracle for
-the scan, because the registered kernel
-supports no functorch/dual transforms and bf16 finite differences are unusable.
-`mamba3_siso_out_ref` is that oracle; these tests assert:
-
-  1. the reference forward matches the registered `mamba3_siso_combined` kernel
-     at the standard bf16 tolerance (it is a faithful reproduction, not a new
-     model), and
-  2. the forward-mode JVP built on it (`mamba3_siso_jvp`) is EXACT against
-     central finite differences of the same reference (fp32).
-
-Together these establish the forward-mode scan contract that the native
-forward-mode scan kernel will implement and gate against.
+The forward-mode construction needs a differentiable reference for the scan,
+because the registered kernel supports no functorch transforms and bf16 finite
+differences are unusable. `mamba3_siso_out_ref` is that reference; these tests
+assert that its forward matches the registered `mamba3_siso_combined` kernel at
+the bf16 tolerance, that the forward-mode JVP built on it (`mamba3_siso_jvp`)
+matches central finite differences of the same reference in fp32, and that the
+chunked recurrence the fused kernels implement matches both.
 """
 
 from __future__ import annotations
 
 import pytest
 import torch
+
+from tests.helpers import cos_rel as _relerr
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -38,13 +34,6 @@ def _make_inputs(dtype: torch.dtype, *, B=2, S=128, H=4, hd=64, N=64, seed=0):
     D = torch.randn(H, device=dev, dtype=torch.float32)
     Z = torch.randn(B, S, H, hd, device=dev, dtype=dtype)
     return Q, K, V, ADT, DT, Trap, Qb, Kb, Ang, D, Z
-
-
-def _relerr(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float]:
-    a, b = a.float().flatten(), b.float().flatten()
-    cos = torch.nn.functional.cosine_similarity(a, b, dim=0).item()
-    rel = ((a - b).abs().max() / (b.abs().max() + 1e-9)).item()
-    return cos, rel
 
 
 @requires_cuda
@@ -84,12 +73,12 @@ def test_scan_jvp_matches_finite_differences() -> None:
 
 @requires_cuda
 @pytest.mark.parametrize("nheads_qk", [1, 4])
-def test_dualscan_recurrent_forward_matches_reference(nheads_qk: int) -> None:
-    """The explicit augmented dual-scan runs the scan in RECURRENT state-space
-    form (the tiling the fused kernel chunks); its forward must match the dense
-    quadratic reference -- gate that the recurrence is the same scan."""
+def test_chunked_scan_recurrent_forward_matches_reference(nheads_qk: int) -> None:
+    """The explicit augmented recurrence runs the scan in state-space form (the
+    tiling the fused kernel chunks); its forward must match the dense quadratic
+    reference."""
     from backbones.mamba3.ops.triton.mamba3.mamba3_siso_ref import mamba3_siso_out_ref
-    from backbones.mamba3.ops.triton.mamba3.mamba3_siso_dualscan_ref import mamba3_siso_dualscan
+    from backbones.mamba3.ops.triton.mamba3.mamba3_siso_chunked_scan_ref import mamba3_siso_chunked_scan
 
     p = _make_inputs(torch.float32, H=4, N=64, seed=3)
     if nheads_qk == 4:  # non-GQA: give Q/K a full head count
@@ -97,42 +86,41 @@ def test_dualscan_recurrent_forward_matches_reference(nheads_qk: int) -> None:
         dev = "cuda"
         p = (torch.randn(B, S, 4, 64, device=dev), torch.randn(B, S, 4, 64, device=dev)) + p[2:]
     tang = tuple(torch.zeros_like(x) for x in p)
-    out_ds, _ = mamba3_siso_dualscan(p, tang, compute_dtype=torch.float32)
+    out_ds, _ = mamba3_siso_chunked_scan(p, tang, compute_dtype=torch.float32)
     out_ref = mamba3_siso_out_ref(*p, compute_dtype=torch.float32)
     cos, rel = _relerr(out_ds, out_ref)
-    assert cos > 0.9999 and rel < 1e-4, f"recurrent dual-scan forward vs dense ref (cos {cos:.6f}, rel {rel:.3e})"
+    assert cos > 0.9999 and rel < 1e-4, f"recurrent forward vs dense reference (cos {cos:.6f}, rel {rel:.3e})"
 
 
 @requires_cuda
-def test_dualscan_jvp_matches_func_jvp() -> None:
-    """The frozen kernel semantics: the hand-derived (S, dS) dual recurrence must
-    equal torch.func.jvp on the dense reference exactly. This is the parity
-    oracle the fused forward-mode kernel transcribes."""
+def test_chunked_scan_jvp_matches_func_jvp() -> None:
+    """The hand-derived (S, dS) recurrence must equal torch.func.jvp on the dense
+    reference; this is the reference the fused forward-mode kernel transcribes."""
     from backbones.mamba3.ops.triton.mamba3.mamba3_siso_ref import mamba3_siso_jvp
-    from backbones.mamba3.ops.triton.mamba3.mamba3_siso_dualscan_ref import mamba3_siso_dualscan
+    from backbones.mamba3.ops.triton.mamba3.mamba3_siso_chunked_scan_ref import mamba3_siso_chunked_scan
 
     p = _make_inputs(torch.float32, seed=5)
     tang = [torch.randn_like(x) for x in p]
     # biases (idx 6,7) and D (idx 9) are parameters -> zero tangent in the region JVP.
     tang[6] = torch.zeros_like(p[6]); tang[7] = torch.zeros_like(p[7]); tang[9] = torch.zeros_like(p[9])
     tang = tuple(tang)
-    _, dout_ds = mamba3_siso_dualscan(p, tang, compute_dtype=torch.float32)
+    _, dout_ds = mamba3_siso_chunked_scan(p, tang, compute_dtype=torch.float32)
     _, dout_true = mamba3_siso_jvp(p, tang, compute_dtype=torch.float32)
     cos, rel = _relerr(dout_ds, dout_true)
-    assert cos > 0.99999 and rel < 1e-4, f"dual-scan JVP vs torch.func.jvp (cos {cos:.6f}, rel {rel:.3e})"
+    assert cos > 0.99999 and rel < 1e-4, f"recurrence JVP vs torch.func.jvp (cos {cos:.6f}, rel {rel:.3e})"
 
 
 @requires_cuda
 @pytest.mark.parametrize("S,cs", [(128, 64), (96, 32), (130, 64), (50, 16)])
-def test_chunked_dualscan_matches_recurrent_and_func_jvp(S: int, cs: int) -> None:
-    """The CHUNKED (SSD) dual-scan -- chunk-local quadratic + inter-chunk (S, dS)
-    state passing, the exact tiling the fused tilelang kernel implements -- must
-    equal both the recurrent dual-scan and torch.func.jvp, at sequence lengths
-    not divisible by the chunk size (padding path)."""
+def test_chunked_chunked_scan_matches_recurrent_and_func_jvp(S: int, cs: int) -> None:
+    """The chunked scan (chunk-local quadratic plus inter-chunk (S, dS) state
+    passing, the tiling the fused tilelang kernel implements) must equal both
+    the recurrent form and torch.func.jvp, including sequence lengths not
+    divisible by the chunk size."""
     from backbones.mamba3.ops.triton.mamba3.mamba3_siso_ref import mamba3_siso_jvp
-    from backbones.mamba3.ops.triton.mamba3.mamba3_siso_dualscan_ref import (
-        mamba3_siso_dualscan,
-        mamba3_siso_dualscan_chunked,
+    from backbones.mamba3.ops.triton.mamba3.mamba3_siso_chunked_scan_ref import (
+        mamba3_siso_chunked_scan,
+        mamba3_siso_chunked_scan_ref_blocked,
     )
 
     p = _make_inputs(torch.float32, S=S, seed=7)
@@ -140,8 +128,8 @@ def test_chunked_dualscan_matches_recurrent_and_func_jvp(S: int, cs: int) -> Non
     tang[6] = torch.zeros_like(p[6]); tang[7] = torch.zeros_like(p[7]); tang[9] = torch.zeros_like(p[9])
     tang = tuple(tang)
 
-    o_rec, _ = mamba3_siso_dualscan(p, tang, compute_dtype=torch.float32)
-    o_ch, do_ch = mamba3_siso_dualscan_chunked(p, tang, chunk_size=cs, compute_dtype=torch.float32)
+    o_rec, _ = mamba3_siso_chunked_scan(p, tang, compute_dtype=torch.float32)
+    o_ch, do_ch = mamba3_siso_chunked_scan_ref_blocked(p, tang, chunk_size=cs, compute_dtype=torch.float32)
     _, do_true = mamba3_siso_jvp(p, tang, compute_dtype=torch.float32)
 
     cos_f, rel_f = _relerr(o_ch, o_rec)
@@ -153,8 +141,8 @@ def test_chunked_dualscan_matches_recurrent_and_func_jvp(S: int, cs: int) -> Non
 @requires_cuda
 def test_scan_jvp_is_r_wide_vmappable() -> None:
     """The message-basis push is r independent JVPs sharing one forward
-    linearization -- confirm vmap over the tangent batch works (the r-wide
-    forward scan the native kernel batches in-tile)."""
+    linearization; vmap over the tangent batch must work (the r-wide forward
+    scan the kernel batches in-tile)."""
     from backbones.mamba3.ops.triton.mamba3.mamba3_siso_ref import mamba3_siso_jvp
 
     primals = _make_inputs(torch.float32)

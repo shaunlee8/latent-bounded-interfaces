@@ -1,16 +1,18 @@
-"""Forward-mode region JVP gates for the transformer backend.
+"""Forward-mode region JVP checks for the transformer backend.
 
-The forward-mode interface Jacobian must produce the SAME A_k as the
-reverse-mode path on a real transformer LBI model, and the fused-kernel
-tangent map must match the torch.func reference on both tangent-basis
-classes (L-constant, where the first-block norm collapse applies, and
-general L-varying, where it is disabled).
+The forward-mode interface Jacobian must produce the same A_k as the
+reverse-mode path on a transformer LBI model, and the fused-kernel tangent
+map must match the torch.func reference on both tangent-basis classes
+(L-constant, where the first-block norm collapse applies, and general
+L-varying, where it is disabled).
 """
 
 from __future__ import annotations
 
 import pytest
 import torch
+
+from tests.helpers import cos_rel, worst_cos_rel
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -22,19 +24,9 @@ def _build_model():
     cfg = LBITrainingConfig(
         vocab_size=64, backbone="transformer", layers=4, dim=256, n_heads=4,
         d_conv=4, region_size=2, message_dim=8, message_hidden_dim=16,
-        dtype="bfloat16",
+        dtype="bfloat16", interface_type="vector_mlp",
     )
     return build_lbi_model(cfg).to(device="cuda", dtype=torch.bfloat16)
-
-
-def _cmp(A, B):
-    worst_cos, worst_rel = 1.0, 0.0
-    for a, b in zip(A, B):
-        a, b = a.float(), b.float()
-        cos = torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
-        rel = ((a - b).abs().max() / (b.abs().max() + 1e-9)).item()
-        worst_cos, worst_rel = min(worst_cos, cos), max(worst_rel, rel)
-    return worst_cos, worst_rel
 
 
 @requires_cuda
@@ -59,8 +51,8 @@ def test_forward_mode_Ak_matches_reverse_on_real_transformer() -> None:
     for a, e in zip(fwd, graph):
         assert a.shape == e.shape
 
-    cos_g, rel_g = _cmp(fwd, graph)
-    cos_n, rel_n = _cmp(fwd, native)
+    cos_g, rel_g = worst_cos_rel(fwd, graph)
+    cos_n, rel_n = worst_cos_rel(fwd, native)
     assert cos_g > 0.999 and rel_g < 3e-2, f"forward-mode A_k vs graph: cos {cos_g:.5f} rel {rel_g:.3e}"
     assert cos_n > 0.999 and rel_n < 3e-2, f"forward-mode A_k vs native: cos {cos_n:.5f} rel {rel_n:.3e}"
 
@@ -98,10 +90,9 @@ def test_kernel_matches_reference_constant_basis() -> None:
 
 
 @requires_cuda
-def test_kernel_matches_reference_general_basis(monkeypatch) -> None:
-    """General L-varying tangent basis: the norm collapse must be disabled
-    (LBI_FWDMODE_BCAST=0) and the kernel path must still match."""
-    monkeypatch.setenv("LBI_FWDMODE_BCAST", "0")
+def test_kernel_matches_reference_general_basis() -> None:
+    """A general L-varying tangent basis takes the norm-JVP path (no first-block
+    collapse) and the kernel path must still match the reference."""
     torch.manual_seed(2)
     model = _build_model()
     input_ids = torch.randint(0, 64, (2, 64), dtype=torch.long, device="cuda")
@@ -120,39 +111,6 @@ def test_kernel_matches_reference_general_basis(monkeypatch) -> None:
         backend.forward_mode_use_kernel = False
     rel = ((kern.float() - ref.float()).abs().max() / ref.float().abs().max()).item()
     assert rel < 3e-2, f"kernel vs reference (general basis): rel {rel:.3e}"
-
-
-@requires_cuda
-def test_kernel_cache_fed_matches_recompute(monkeypatch) -> None:
-    """The cache-fed tangent thread (primal operating points read from the
-    region forward's caches) must match the recompute path; both must match
-    the reference. The operating points differ only by the cached chain's
-    fp32 residuals versus the recomputed bf16 chain."""
-    torch.manual_seed(4)
-    model = _build_model()
-    input_ids = torch.randint(0, 64, (2, 64), dtype=torch.long, device="cuda")
-    _, cache = model.forward_with_cache(input_ids)
-    region_cache = cache["region_caches"][0].backend_cache
-    backend = model.region_backend
-
-    B, L, D = region_cache.region_input.shape
-    P = 4
-    basis = (torch.randn(B, P, 1, D, device="cuda", dtype=torch.bfloat16) * 0.1
-             ).expand(-1, -1, L, -1).contiguous()
-    ref = backend.region_output_jvp(cache=region_cache, region_input_tangent_basis=basis)
-    backend.forward_mode_use_kernel = True
-    try:
-        monkeypatch.setenv("LBI_FWDMODE_CACHEPRE", "1")
-        fed = backend.region_output_jvp(cache=region_cache, region_input_tangent_basis=basis)
-        monkeypatch.setenv("LBI_FWDMODE_CACHEPRE", "0")
-        rec = backend.region_output_jvp(cache=region_cache, region_input_tangent_basis=basis)
-    finally:
-        backend.forward_mode_use_kernel = False
-    rel_fr = ((fed.float() - rec.float()).abs().max() / rec.float().abs().max()).item()
-    rel_ref = ((fed.float() - ref.float()).abs().max() / ref.float().abs().max()).item()
-    assert rel_fr < 2e-2, f"cache-fed vs recompute: rel {rel_fr:.3e}"
-    assert rel_ref < 3e-2, f"cache-fed vs reference: rel {rel_ref:.3e}"
-
 
 @requires_cuda
 def test_native_vjp_matches_autograd_lowering() -> None:
@@ -210,7 +168,6 @@ def test_kernel_cuda_attention_matches_triton(monkeypatch) -> None:
     full-length region (L=2048, hd64)."""
     from backends import transformer_forward_mode as fm
 
-    monkeypatch.delenv("LBI_FWDMODE_CUDA_ATTN", raising=False)
     if fm._resolve_cuda_attn_jvp() is None:
         pytest.skip("CUDA flash-JVP unavailable (needs sm_90a + toolchain)")
 
@@ -221,12 +178,38 @@ def test_kernel_cuda_attention_matches_triton(monkeypatch) -> None:
     basis = torch.randn(2, 8, 2048, 256, device="cuda", dtype=torch.bfloat16) * 0.02
     _, cache = backend.forward_region(region_input=x, region_index=0)
 
-    monkeypatch.setenv("LBI_FWDMODE_CUDA_ATTN", "0")
+    monkeypatch.setattr(fm, "_CUDA_ATTN_JVP", False)   # Triton kernel
     ref = fm.transformer_region_output_jvp_kernel(
         backend, cache=cache, region_input_tangent_basis=basis)
-    monkeypatch.setenv("LBI_FWDMODE_CUDA_ATTN", "1")
+    monkeypatch.setattr(fm, "_CUDA_ATTN_JVP", None)    # re-resolve the CUDA kernel
     got = fm.transformer_region_output_jvp_kernel(
         backend, cache=cache, region_input_tangent_basis=basis)
 
-    cos, rel = _cmp([got], [ref])
+    cos, rel = cos_rel(got, ref)
     assert cos > 0.9999 and rel < 2e-2, (cos, rel)
+
+
+@requires_cuda
+def test_flash_jvp_query_suffix_matches_full() -> None:
+    # The suffix-query flash JVP (full-length K/V, suffix tangents) must equal
+    # the square kernel's suffix rows when the tangent prefix is zero.
+    from backbones.transformer.ops.triton.region_jvp import flash_attention_jvp
+
+    torch.manual_seed(5)
+    B, H, L, HD, r, s = 2, 4, 256, 64, 3, 64
+    q, k, v = (torch.randn(B, H, L, HD, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    dq, dk, dv = (torch.randn(r, B, H, L, HD, device="cuda", dtype=torch.bfloat16) * 0.1
+                  for _ in range(3))
+    for t in (dq, dk, dv):
+        t[:, :, :, :s] = 0.0
+    o_full, do_full = flash_attention_jvp(q, k, v, dq, dk, dv, 0.125)
+    o_suf, do_suf = flash_attention_jvp(
+        q, k, v,
+        dq[:, :, :, s:].contiguous(), dk[:, :, :, s:].contiguous(),
+        dv[:, :, :, s:].contiguous(), 0.125, query_start=s)
+    assert torch.equal(o_suf, o_full[:, :, s:])
+    assert torch.allclose(do_suf.float(), do_full[:, :, :, s:].float(), atol=2e-3, rtol=2e-2)
+    # And the tangent prefix of the full result is exactly zero.
+    assert do_full[:, :, :, :s].float().abs().max().item() == 0.0
+
+

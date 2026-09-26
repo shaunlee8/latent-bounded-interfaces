@@ -12,21 +12,17 @@ import torch.nn as nn
 class InterfaceSpec:
     """Static state and region-conditioning dimensions for an interface."""
 
-    state_shape: tuple[int, ...]
     state_flat_dim: int
     region_condition_dim: int
-    # Token-wise interfaces decode a [B, L, D] condition (one read per token);
-    # otherwise decode yields a single [B, D] vector broadcast over the sequence.
-    condition_is_tokenwise: bool = False
 
 
 @dataclass
 class InterfaceStep:
-    """Result of one boundary update, including optional diagnostic tensors."""
+    """Result of one boundary update: the new state and the intermediates the
+    Jacobian applications reuse."""
 
     state: torch.Tensor
     diagnostics: dict[str, torch.Tensor] = field(default_factory=dict)
-    cache: Any | None = None
 
 
 class InterfaceModule(nn.Module, ABC):
@@ -43,13 +39,7 @@ class InterfaceModule(nn.Module, ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def decode(
-        self,
-        state: torch.Tensor,
-        region_index: int,
-        *,
-        canvas_features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def decode(self, state: torch.Tensor, region_index: int) -> torch.Tensor:
         raise NotImplementedError
 
     @abstractmethod
@@ -91,25 +81,3 @@ class InterfaceModule(nn.Module, ABC):
     ) -> dict[str, torch.Tensor]:
         """Apply the decode-side Jacobian transpose to a basis of region-input cotangents."""
         raise NotImplementedError(f"{type(self).__name__} does not expose structured decode pullbacks.")
-
-    def apply_region_transition_jacobian_t(
-        self,
-        *,
-        region_cache: Any,
-        state_out_cotangent_basis: torch.Tensor,
-        region_input_cotangent_basis: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Apply the full interface transition Jacobian transpose for one region."""
-        update = self.apply_update_jacobian_t_to_region_output(
-            region_cache=region_cache,
-            state_out_cotangent_basis=state_out_cotangent_basis,
-        )
-        decode = self.apply_decode_jacobian_t_to_state_input(
-            region_cache=region_cache,
-            region_input_cotangent_basis=region_input_cotangent_basis,
-        )
-        return {
-            **update,
-            **decode,
-            "g_state_input_total": update["g_state_skip"] + decode["g_state_input"],
-        }

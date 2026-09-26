@@ -1,6 +1,6 @@
 # Data And Tokenization
 
-The canonical paper runs use FineWeb-Edu text exported locally, then pretokenized into int32 token shards with the original 32k LLaMA tokenizer.
+The paper runs use FineWeb-Edu text exported locally, then pretokenized into int32 token shards with the original 32k LLaMA tokenizer.
 
 ## Paths
 
@@ -28,13 +28,7 @@ ${LBI_DATA_ROOT}/corpora/fineweb_edu/tokens/fineweb_edu_llama/
   val_*.bin
 ```
 
-The tokenizer directory is not committed. It should be a local Hugging Face-compatible original LLaMA tokenizer directory. The paper configuration uses:
-
-- `TOKENIZER_TYPE=llama`
-- `VOCAB_SIZE=32000`
-- tied input/output embeddings
-
-The paper uses the original 32k LLaMA tokenizer. Reviewers should request access to the official Meta Llama 2 Hugging Face repository:
+The tokenizer directory is not committed. It is a local Hugging Face-compatible original LLaMA tokenizer directory (32,000 tokens); training ties the input and output embeddings. Reviewers should request access to the official Meta Llama 2 Hugging Face repository:
 
 ```text
 https://huggingface.co/meta-llama/Llama-2-7b-hf
@@ -91,22 +85,16 @@ This streams `HuggingFaceFW/fineweb-edu` and writes bounded train/validation tex
 ```bash
 ${PYTHON_BIN:-python} -m data.pretokenize_corpus \
   --text-corpus fineweb_edu \
-  --tokenizer-type llama \
-  --vocab-size 32000 \
   --tokenizer-path ${LBI_LLAMA_TOKENIZER_ROOT} \
   --shard-tokens 5000000
 ```
 
-Training uses `data_mode=text_bpe_sharded`, which reads `train_manifest.json` and `val_manifest.json` through `data.token_shards.TokenShardCorpus`.
+Training reads `train_manifest.json` and `val_manifest.json` through `data.token_shards.TokenShardCorpus`.
 
 ## File Roles
 
-- `data_paths.py`: environment-configurable roots for corpora and tokenizer directories.
+- `data_paths.py`: environment-configurable roots for the corpora and the tokenizer directory.
 - `export_fineweb_edu.py`: FineWeb-Edu text export.
-- `pretokenize_corpus.py`: tokenizer loading and token-shard creation.
-- `token_shards.py`: memory-mapped int32 shard sampler used by paper training.
-- `bpe_tokenizer.py`: SentencePiece and Hugging Face tokenizer wrappers.
-- `lm_data.py`: legacy: byte-level helpers for old data modes.
-- `train_data.py`: legacy: synthetic sequence-task helpers for smoke tests and debug runs.
-
-Canonical paper runs do not use `text_byte` or synthetic data; those paths are kept so the smoke tests and debug modes remain importable.
+- `pretokenize_corpus.py`: token-shard creation.
+- `tokenizer.py`: the LLaMA tokenizer wrapper.
+- `token_shards.py`: memory-mapped int32 shard sampler used by training and evaluation.

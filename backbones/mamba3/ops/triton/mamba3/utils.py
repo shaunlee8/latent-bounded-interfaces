@@ -101,33 +101,12 @@ def sigmoid_approx(x):
     Returns:
         Approximate sigmoid values in float32
     """
-    # tanh_half_x = tl.inline_asm_elementwise(
-    #     "tanh.approx.f32 $0, $1;",
-    #     constraints="=f,f",
-    #     args=[0.5 * x],
-    #     dtype=tl.float32,
-    #     is_pure=True,
-    #     pack=1,
-    # )
-    # return 0.5 * (1.0 + tanh_half_x)
-    # NOTE: We ended up using the built-in sigmoid for better performance, as the PTX approximation was not faster in this case.
+    # The built-in sigmoid outperforms the PTX tanh approximation here.
     return tl.sigmoid(x)
 
 @triton.jit
 def silu(x):
-    """
-    SiLU (Swish) activation function: x * sigmoid(x).
-
-    Formula: silu(x) = 0.5*x * (1 + tanh(0.5*x)) + 0.5*x.
-    Leverages fast tanh_approx for speed.
-    
-    Args:
-        x: Input triton tensor (any shape) in float32
-    
-    Returns:
-        SiLU activation output in float32
-    """
-    # x_half = 0.5 * x
-    # return x_half * tanh_approx(x_half) + x_half
-    # NOTE: We ended up using the built-in sigmoid for better performance, as the PTX approximation was not faster in this case.
+    """SiLU activation x * sigmoid(x), computed as 0.5*x * (1 + tanh(0.5*x)) + 0.5*x
+        with the fast tanh approximation; fp32 in and out."""
+    # The built-in sigmoid outperforms the PTX tanh approximation here.
     return x*tl.sigmoid(x)

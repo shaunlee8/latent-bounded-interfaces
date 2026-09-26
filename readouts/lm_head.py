@@ -5,15 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from canvas import CanvasModule
-from .base import ReadoutCache
 
 
 class NormLMHeadReadout(nn.Module):
-    """Applies final normalization and maps final region features to vocabulary logits.
-
-    With tied embeddings, logits are computed with ``canvas.output_weight()``.
-    With untied embeddings, this module registers a separate linear LM head.
-    """
+    """Applies the final normalization and maps the last region's features to
+    vocabulary logits. Tied readouts use `canvas.output_weight()`; untied
+    readouts own a linear LM head."""
 
     def __init__(
         self,
@@ -42,19 +39,6 @@ class NormLMHeadReadout(nn.Module):
         if logits_input.dtype != self.lm_head.weight.dtype:
             logits_input = logits_input.to(dtype=self.lm_head.weight.dtype)
         return self.lm_head(logits_input)
-
-    def forward_with_cache(self, features: torch.Tensor, *, canvas: CanvasModule) -> tuple[torch.Tensor, ReadoutCache]:
-        normed_features = self.norm(features)
-        if self.tie_embeddings:
-            weight = canvas.output_weight()
-            logits_input = normed_features.to(dtype=weight.dtype) if normed_features.dtype != weight.dtype else normed_features
-            logits = F.linear(logits_input, weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("untied readout is missing lm_head")
-            logits_input = normed_features.to(dtype=self.lm_head.weight.dtype) if normed_features.dtype != self.lm_head.weight.dtype else normed_features
-            logits = self.lm_head(logits_input)
-        return logits, ReadoutCache(features=features, normed_features=normed_features, logits=logits)
 
     def vjp_parameters(self) -> list[nn.Parameter]:
         params = [param for param in self.norm.parameters() if param.requires_grad]

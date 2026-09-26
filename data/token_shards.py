@@ -4,7 +4,6 @@ import json
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
@@ -89,9 +88,5 @@ def sample_batch_token_shards(
     return x, y
 
 
-def corpus_numel(corpus: Any) -> int:
-    if isinstance(corpus, torch.Tensor):
-        return int(corpus.numel())
-    if isinstance(corpus, TokenShardCorpus):
-        return int(corpus.num_tokens_total)
-    raise TypeError(f"unsupported corpus type: {type(corpus).__name__}")
+def corpus_numel(corpus: TokenShardCorpus) -> int:
+    return int(corpus.num_tokens_total)

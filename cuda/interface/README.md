@@ -14,7 +14,7 @@ The suffix scan computes products and returns:
 [batch, num_regions + 1, rank, rank]
 ```
 
-These suffix products propagate message adjoints across regions. Backend-local activation pullbacks live in backend-specific CUDA folders such as `cuda/transformer/`.
+These suffix products propagate the interface-state adjoints across regions.
 
 ## Build
 

@@ -33,7 +33,8 @@ class DenseLanguageModel(nn.Module):
             init_transformer_module(self.readout, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
         elif backbone_spec.name == "hybrid":
             init_transformer_module(self.canvas, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
-            for layer_type, block in zip(backbone_spec.layer_types, self.blocks):
+            assert backbone_spec.layer_types is not None
+            for layer_type, block in zip(backbone_spec.layer_types, self.backbone.blocks):
                 if layer_type == "transformer":
                     init_transformer_module(block, n_layers=backbone_spec.layers, n_residuals_per_layer=2)
             init_transformer_module(self.readout, n_layers=backbone_spec.layers, n_residuals_per_layer=2)

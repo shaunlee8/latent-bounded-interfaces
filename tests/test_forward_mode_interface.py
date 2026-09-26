@@ -1,14 +1,9 @@
-"""Gates for the forward-mode interface JVP methods and A_k assembly.
-
-The forward-mode interface Jacobian A_k = skip + encode . J_region . decode
-(applied to the identity input basis) reuses the same interface as the
-reverse-mode path, so correctness reduces to: (A) the JVP methods
-(decode/update forward) are exact adjoints of the validated transpose methods
--- an inner-product identity at machine precision; and (B) the assembly and
-index/transpose conventions produce the true A_k, checked end-to-end against
-autograd on a self-contained torch region. The region JVP here is
-torch.func.jvp through a torch region, the oracle for the kernel providers.
-"""
+"""Checks for the forward-mode interface JVP methods and the A_k assembly.
+The decode and update JVPs must be exact adjoints of the transpose methods (an
+inner-product identity at machine precision), and the assembled
+A_k = skip + encode . J_region . decode must match autograd on a
+self-contained torch region. The region JVP here is torch.func.jvp through a
+torch region, the reference for the kernel providers."""
 
 from __future__ import annotations
 

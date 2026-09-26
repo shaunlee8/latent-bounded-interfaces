@@ -1,21 +1,10 @@
 """Differentiable pure-PyTorch reference for the Mamba-3 SISO scan forward.
+The registered Triton scan is a custom autograd.Function without forward-mode
+support, so this reference is what `torch.func.jvp` differentiates to produce
+the scan JVP the fused kernels are checked against; batched, zero initial
+state.
 
-This is the autodiff ORACLE for the forward-mode (JVP) interface-Jacobian work.
-The registered Triton scan (`mamba3_siso_combined` / `mamba3_siso_fwd`) is a
-custom autograd.Function that supports NEITHER functorch transforms nor
-forward-mode dual numbers, so `torch.func.jvp` cannot push a message tangent
-through it, and in bf16 finite differences are unusable. A faithful,
-differentiable torch reproduction of the same scan is therefore the only exact
-way to obtain the forward-mode scan JVP in-repo, and it is the parity oracle
-the native forward-mode scan kernels gate against.
-
-The math is ported verbatim from the upstream reference
-(`~/src/mamba/tests/ops/triton/test_mamba3_siso.py::mamba3_siso_fwd_ref`), which
-their own tests assert matches the Triton kernel. Restricted to the LBI region
-case: batched (no varlen) and zero initial state (the cross-region state is the
-bounded message `m_k`, NOT the SSM state -- each region's scan starts fresh).
-
-Input conventions match the registered kernel exactly:
+Input conventions match the registered kernel:
   Q, K   : [B, S, H_qk, Dqk]     (pre-rotary, pre-bias)
   V      : [B, S, H, Dv]
   ADT    : [B, H, S]             already the negative decay (-softplus(...)*dt)
@@ -26,8 +15,7 @@ Input conventions match the registered kernel exactly:
   Angles : [B, S, H, Da]         raw (tanh*pi applied here)
   D      : [H] or None           skip
   Z      : [B, S, H, Dv] or None SiLU gate
-Returns Out [B, S, H, Dv] with Z-gating applied (matches the kernel's `Out`).
-"""
+Returns Out [B, S, H, Dv] with Z-gating applied (the kernel's `Out`)."""
 
 from __future__ import annotations
 
@@ -85,7 +73,7 @@ def mamba3_siso_out_ref(
     """Gated SISO scan output `Out` [B, S, H, Dv], fully differentiable.
 
     Zero initial state, batched. `compute_dtype` is the working precision (use
-    fp32 for the forward-mode oracle; the recurrence is exact linear algebra so
+    fp32 for the forward-mode reference; the recurrence is exact linear algebra so
     fp32 gives a clean JVP even when the model runs bf16)."""
     batch, seqlen, nheads_qk, _ = Q.shape
     _, _, nheads, headdim_v = V.shape
@@ -168,13 +156,10 @@ def mamba3_siso_jvp(
     *,
     compute_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Forward-mode JVP of the SISO scan: push scan-input tangents to `dOut`.
-
-    `primals` / `tangents` are ordered (Q, K, V, ADT, DT, Trap, Q_bias, K_bias,
-    Angles[, D][, Z]) -- the differentiable scan inputs. Returns (Out, dOut).
-    This is the forward-linearized scan (the compute-bound regime); the native
-    forward-mode kernel implements exactly this map. Tangents for inputs that do
-    not vary in a given direction should be zeros_like."""
+    """Forward-mode JVP of the SISO scan: pushes scan-input tangents to `dOut`.
+        `primals` and `tangents` are ordered (Q, K, V, ADT, DT, Trap, Q_bias,
+        K_bias, Angles[, D][, Z]), with zeros_like tangents for inputs that do not
+        vary in a direction; returns (Out, dOut)."""
 
     def f(*args: torch.Tensor) -> torch.Tensor:
         return mamba3_siso_out_ref(*args, compute_dtype=compute_dtype)

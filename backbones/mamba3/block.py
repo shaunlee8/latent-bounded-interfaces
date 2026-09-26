@@ -21,7 +21,7 @@ class Mamba3BlockForwardCache:
 
 
 class Mamba3Block(nn.Module):
-    """Minimal Add -> RMSNorm -> Mixer block for the LBI Mamba-3 SISO port."""
+    """Add -> RMSNorm -> Mamba-3 mixer block."""
 
     def __init__(
         self,
@@ -44,7 +44,6 @@ class Mamba3Block(nn.Module):
             headdim=headdim,
             ngroups=ngroups,
             chunk_size=chunk_size,
-            is_mimo=False,
             device=device,
             dtype=dtype,
         )

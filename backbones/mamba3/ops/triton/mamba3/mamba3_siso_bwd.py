@@ -15,9 +15,7 @@ import triton
 import triton.language as tl
 from backbones.mamba3.ops.triton.mamba3.utils import cos_approx, sin_approx, sigmoid_approx
 
-# =============================================================================
-# dZ Kernel
-# =============================================================================
+# --- dZ Kernel ---
 
 @triton.autotune(
     configs=[
@@ -93,9 +91,7 @@ def mamba3_siso_bwd_kernel_dzdo(
     # Scale dO by sigmoid(Z)
     do_block = do_block * sigmoid_z
 
-    # Compute dZ gradient
-    # d/dZ [O * Z * sigmoid(Z)] = O * sigmoid(Z) * (1 + Z * (1 - sigmoid(Z)))
-    #                           = O * sigmoid(Z) + O * Z * sigmoid(Z) * (1 - sigmoid(Z))
+    # dZ gradient: d/dZ [O*Z*sigmoid(Z)] = O*sigmoid(Z)*(1 + Z*(1 - sigmoid(Z)))
     dz_block = do_block * o_block * (1 + z_block * (1 - sigmoid_z))
     
     # Store dZ
@@ -186,9 +182,7 @@ def compute_dzdo(
     return dz, do_scaled
 
 
-# =============================================================================
-# dQKV Kernel
-# =============================================================================
+# --- dQKV Kernel ---
 
 @triton.autotune(
     configs=[
@@ -391,28 +385,21 @@ def mamba3_siso_bwd_kernel_dqkv(
         offs_cs = chunk_start + tl.arange(0, CHUNK_SIZE)
         seq_mask = offs_cs < seqlen
 
-        # ============================================================
-        # Load Decay Values
-        # We load these first to overlap computation with TMA loads
-        # ============================================================
+        # --- Load Decay Values; We load these first to overlap computation with TMA loads ---
         da_cs_ptrs = DA_CS + da_cs_offset + offs_cs * stride_da_cs_seqlen
         da_cs = tl.load(da_cs_ptrs, mask=seq_mask, other=0.0)  # Cumulative decay within chunk: (CHUNK_SIZE,)
 
         da_cs_sum_ptrs = DA_CS_SUM + da_cs_sum_offset + chunk_idx * stride_da_cs_sum_seqlen
         da_cs_chunk_sum = tl.load(da_cs_sum_ptrs)  # Total decay for this chunk: scalar
 
-        # ============================================================
-        # Load Q, K, V, dO, SSM_States via TMA
-        # ============================================================
+        # --- Load Q, K, V, dO, SSM_States via TMA ---
         do_block = do_desc.load([chunk_start, 0])  # (CHUNK_SIZE, HEADDIM_V)
         v_block = v_desc.load([chunk_start, 0])    # (CHUNK_SIZE, HEADDIM_V)
         q_block = q_desc.load([chunk_start, 0])    # (CHUNK_SIZE, HEADDIM_QK)
         k_block = k_desc.load([chunk_start, 0])    # (CHUNK_SIZE, HEADDIM_QK)
         ssm_states_block = ssm_states_desc.load([0, chunk_idx * headdim_qk])  # (HEADDIM_V, HEADDIM_QK)
 
-        # ============================================================
-        # Compute Decay Scaling Factors
-        # ============================================================
+        # --- Compute Decay Scaling Factors ---
         # Reverse cumsum: how much decay from position i to end of chunk
         da_cs_rev = da_cs_chunk_sum - da_cs
         exp_da_cs_rev = tl.math.exp2(da_cs_rev)  # For scaling inter-chunk contributions
@@ -426,10 +413,7 @@ def mamba3_siso_bwd_kernel_dqkv(
                 0.0
             )
 
-        # ============================================================
-        # Compute dADT Gradient (Part 1): From Intra-chunk Attention
-        # This is register-heavy so we compute it early before spilling
-        # ============================================================
+        # --- Compute dADT Gradient (Part 1): From Intra-chunk Attention; This is register-heavy so we compute it early before spilling ---
         # Gradient contribution from (QK^T ⊙ L) V term
         dAinv = tl.dot(v_block, tl.trans(do_block))  # V @ dO^T
         if RECOMPUTE_MASK:
@@ -444,10 +428,7 @@ def mamba3_siso_bwd_kernel_dqkv(
         dAinv *= tl.dot(k_block, tl.trans(q_block))  # Element-wise with K @ Q^T
         dM_rev_vector = tl.sum(dAinv, axis=0) - tl.sum(dAinv, axis=1)  # (CHUNK_SIZE,)
 
-        # ============================================================
-        # Compute dK: Key Gradient
-        # dK = (V @ dO^T ⊙ mask)^T @ Q + V @ dStates * scale
-        # ============================================================
+        # --- Compute dK: Key Gradient; dK = (V @ dO^T ⊙ mask)^T @ Q + V @ dStates * scale ---
         # Intra-chunk: dP^T @ Q where dP = dO @ V^T ⊙ mask
         dp_t_block = tl.dot(v_block, tl.trans(do_block))  # V @ dO^T: (CHUNK_SIZE, CHUNK_SIZE)
         if RECOMPUTE_MASK:
@@ -467,10 +448,7 @@ def mamba3_siso_bwd_kernel_dqkv(
 
         dk_desc.store([chunk_start, 0], acc_dk)
 
-        # ============================================================
-        # Compute dQ: Query Gradient
-        # dQ = (V @ dO^T ⊙ mask) @ K + dO @ States * scale
-        # ============================================================
+        # --- Compute dQ: Query Gradient; dQ = (V @ dO^T ⊙ mask) @ K + dO @ States * scale ---
         # Intra-chunk: S^T @ K where S = V @ dO^T ⊙ mask
         s_block = tl.dot(v_block, tl.trans(do_block))  # (CHUNK_SIZE, CHUNK_SIZE)
         if RECOMPUTE_MASK:
@@ -490,10 +468,7 @@ def mamba3_siso_bwd_kernel_dqkv(
 
         dq_desc.store([chunk_start, 0], acc_dq)
 
-        # ============================================================
-        # Compute dV: Value Gradient
-        # dV = (K @ Q^T ⊙ mask) @ dO + K @ dStates^T * scale + dO * (D + qk_dot)
-        # ============================================================
+        # --- Compute dV: Value Gradient; dV = (K @ Q^T ⊙ mask) @ dO + K @ dStates^T * scale + dO * (D + qk_dot) ---
         # Intra-chunk: P^T @ dO where P = Q @ K^T ⊙ mask
         p_t_block = tl.dot(k_block, tl.trans(q_block))  # K @ Q^T: (CHUNK_SIZE, CHUNK_SIZE)
         if RECOMPUTE_MASK:
@@ -529,9 +504,7 @@ def mamba3_siso_bwd_kernel_dqkv(
 
         dv_desc.store([chunk_start, 0], acc_dv)
 
-        # ============================================================
-        # Compute dQK_Dot and dD: Skip Connection Gradients
-        # ============================================================
+        # --- Compute dQK_Dot and dD: Skip Connection Gradients ---
         v_block_reloaded = tl.load(
             V + v_offset + offs_cs[:, None] * stride_v_seqlen +
             tl.arange(0, HEADDIM_V)[None, :] * stride_v_vdim,
@@ -559,16 +532,12 @@ def mamba3_siso_bwd_kernel_dqkv(
                 dQK_dot_block
             ).reshape(1)
 
-        # ============================================================
-        # Compute dADT Gradient (Part 2): From Inter-chunk States
-        # ============================================================
+        # --- Compute dADT Gradient (Part 2): From Inter-chunk States ---
         # Gradient from Q @ States^T term
         QS = tl.dot(q_block, tl.trans(ssm_states_block))  # (CHUNK_SIZE, HEADDIM_V)
         dM_rev_vector += tl.sum(QS * dO_reloaded, axis=1) * exp_da_cs  # (CHUNK_SIZE,)
 
-        # ============================================================
-        # Compute dADT Gradient (Part 3): From State Accumulation
-        # ============================================================
+        # --- Compute dADT Gradient (Part 3): From State Accumulation ---
         # Gradient flowing through d_ssm_states_acc @ SSM_States
         SSM_States_ptrs = (SSM_States + ssm_states_offset +
                 tl.arange(0, HEADDIM_V)[:, None] * stride_ssm_states_vdim +
@@ -578,24 +547,18 @@ def mamba3_siso_bwd_kernel_dqkv(
         SSM_States_reloaded = tl.load(SSM_States_ptrs, volatile=True, mask=SSM_States_mask)  # (HEADDIM_V, HEADDIM_QK)
         dM_scalar = tl.sum(SSM_States_reloaded * d_ssm_states_acc) * tl.math.exp2(da_cs_chunk_sum)
 
-        # ============================================================
-        # Compute dADT Gradient (Part 4): From K @ dStates
-        # ============================================================
+        # --- Compute dADT Gradient (Part 4): From K @ dStates ---
         dSK = tl.dot(k_block, tl.trans(d_ssm_states_acc).to(k_block.dtype))  # (CHUNK_SIZE, HEADDIM_V)
         dM_vector = tl.sum(dSK * v_block_reloaded, axis=1) * exp_da_cs_rev  # (CHUNK_SIZE,)
 
-        # ============================================================
-        # Combine dADT Gradient Components via Reverse Cumsum
-        # ============================================================
+        # --- Combine dADT Gradient Components via Reverse Cumsum ---
         dM_rev_vector += (tl.sum(dM_rev_vector) + dM_scalar) + tl.cumsum(dM_vector - dM_rev_vector) - dM_vector
 
         # Store dADT
         dadt_ptrs = dADT + dadt_offset + offs_cs * stride_dadt_seqlen
         tl.store(dadt_ptrs, dM_rev_vector, mask=seq_mask)
 
-        # ============================================================
-        # Accumulate State Gradients for Previous Chunks
-        # ============================================================
+        # --- Accumulate State Gradients for Previous Chunks ---
         dO_reloaded *= exp_da_cs[:, None]
         d_ssm_states_acc = (tl.math.exp2(da_cs_chunk_sum) * d_ssm_states_acc +
                        tl.dot(tl.trans(dO_reloaded).to(q_block.dtype), q_block))
@@ -794,9 +757,7 @@ def compute_dqkv(
     return dq, dk, dv, dAdt, dQK, dD, d_issm_state
 
 
-# =============================================================================
-#  d Rotary+Bias Kernel
-# =============================================================================
+# --- d Rotary+Bias Kernel ---
 
 
 @triton.autotune(
@@ -895,9 +856,7 @@ def mamba3_siso_bwd_kernel_rotary_bias_angles(
 
         # Outer loop: iterate over qk_heads
         for qk_head_idx in range(nheads_qk):
-            # ============================================================
-            # Load Q, K for this qk_head (once per GQA group)
-            # ============================================================
+            # --- Load Q, K for this qk_head (once per GQA group) ---
             q_offset = q_offset_base + qk_head_idx * stride_q_head
             k_offset = k_offset_base + qk_head_idx * stride_k_head
             q_ptrs = Q + q_offset + offs_s[:, None] * stride_q_seqlen + offs_d[None, :] * stride_q_qkdim
@@ -911,9 +870,7 @@ def mamba3_siso_bwd_kernel_rotary_bias_angles(
             for gqa_idx in range(GQA_RATIO):
                 nhead_idx = qk_head_idx * GQA_RATIO + gqa_idx
                 
-                # ============================================================
-                # Load per-head data
-                # ============================================================
+                # --- Load per-head data ---
                 # Bias for this head
                 q_bias = tl.load(
                     Q_bias + nhead_idx * stride_q_bias_head + offs_d * stride_q_bias_qkdim,
@@ -953,9 +910,7 @@ def mamba3_siso_bwd_kernel_rotary_bias_angles(
                 dK_in_load = tl.load(dK_in + dk_in_offset + offs_s[:, None] * stride_dk_in_seqlen + offs_d[None, :] * stride_dk_in_qkdim,
                     mask=(offs_s[:, None] < seqlen) & (offs_d[None, :] < headdim_qk), other=0.0)
                 
-                # ============================================================
-                # Compute dGamma = dQK * (Q_wbias · K_wbias)
-                # ============================================================
+                # --- Compute dGamma = dQK * (Q_wbias · K_wbias) ---
                 QK_dot = tl.sum(Q_wbias * K_wbias, axis=1)
                 d_gamma = dqk * QK_dot
                 dgamma_store_offset = dgamma_offset_base + nhead_idx * stride_dgamma_head
@@ -963,15 +918,11 @@ def mamba3_siso_bwd_kernel_rotary_bias_angles(
                     dGamma + dgamma_store_offset + offs_s * stride_dgamma_seqlen + nhead_qk_id * stride_dgamma_nqkchunks, 
                     d_gamma, mask=offs_s < seqlen)
                 
-                # ============================================================
-                # Compute cos/sin for rotary
-                # ============================================================
+                # --- Compute cos/sin for rotary ---
                 cos_angle = cos_approx(theta.to(tl.float32))
                 sin_angle = sin_approx(theta.to(tl.float32))
                 
-                # ============================================================
-                # Compute dScale = sum(dK_in * K_rot)
-                # ============================================================
+                # --- Compute dScale = sum(dK_in * K_rot) ---
                 K_r = tl.reshape(K_wbias, [CHUNK_SIZE, BLOCK_HEADDIM_QK // 2, 2])
                 K_r0, K_r1 = tl.split(K_r)
                 K_rot0 = K_r0 * cos_angle - K_r1 * sin_angle
@@ -984,9 +935,7 @@ def mamba3_siso_bwd_kernel_rotary_bias_angles(
                     dScale + dscale_store_offset + offs_s * stride_dscale_seqlen + nhead_qk_id * stride_dscale_nqkchunks, 
                     dscale_val, mask=offs_s < seqlen)
                 
-                # ============================================================
-                # Compute dQ_pre, dK_pre through inverse rotary
-                # ============================================================
+                # --- Compute dQ_pre, dK_pre through inverse rotary ---
                 dK_in_scaled = dK_in_load * scale[:, None] # shape: (CHUNK_SIZE, BLOCK_HEADDIM_QK)
 
                 Q_r = tl.reshape(Q_wbias, [CHUNK_SIZE, BLOCK_HEADDIM_QK // 2, 2])
@@ -1011,15 +960,11 @@ def mamba3_siso_bwd_kernel_rotary_bias_angles(
                 dQ_pre = dQ_pre + dqk_scaled * K_wbias
                 dK_pre = dK_pre + dqk_scaled * Q_wbias
                 
-                # ============================================================
-                # Accumulate dQ, dK for GQA reduction
-                # ============================================================
+                # --- Accumulate dQ, dK for GQA reduction ---
                 dq_acc += dQ_pre
                 dk_acc += dK_pre
                 
-                # ============================================================
-                # Store dQ_bias, dK_bias for this head (sum over chunk)
-                # ============================================================
+                # --- Store dQ_bias, dK_bias for this head (sum over chunk) ---
                 dq_bias_out = tl.sum(dQ_pre, axis=0)
                 dk_bias_out = tl.sum(dK_pre, axis=0)
                 dq_bias_store_offset = dq_bias_offset_base + nhead_idx * stride_dq_bias_head
@@ -1027,9 +972,7 @@ def mamba3_siso_bwd_kernel_rotary_bias_angles(
                 tl.store(dQ_bias + dq_bias_store_offset + offs_d * stride_dq_bias_qkdim, dq_bias_out, mask=offs_d < headdim_qk)
                 tl.store(dK_bias + dk_bias_store_offset + offs_d * stride_dk_bias_qkdim, dk_bias_out, mask=offs_d < headdim_qk)
                 
-                # ============================================================
-                # Compute and store dAngles for this head
-                # ============================================================
+                # --- Compute and store dAngles for this head ---
                 dtheta_q = dQ_in_r0 * (-Q_r0 * sin_angle - Q_r1 * cos_angle) + dQ_in_r1 * (Q_r0 * cos_angle - Q_r1 * sin_angle)
                 dtheta_k = dK_in_r0 * (-K_r0 * sin_angle - K_r1 * cos_angle) + dK_in_r1 * (K_r0 * cos_angle - K_r1 * sin_angle)
                 dtheta = dtheta_q + dtheta_k
@@ -1039,9 +982,7 @@ def mamba3_siso_bwd_kernel_rotary_bias_angles(
                     dAngles + dangle_store_offset + offs_s[:, None] * stride_dangles_seqlen + offs_dr[None, :] * stride_dangles_qkdim, 
                     dtheta, mask=(offs_dr[None, :] < headdim_angles) & (offs_s[:, None] < seqlen))
             
-            # ============================================================
-            # End of GQA group: store accumulated dQ, dK
-            # ============================================================
+            # --- End of GQA group: store accumulated dQ, dK ---
             dq_offset = dq_offset_base + qk_head_idx * stride_dq_head
             dk_offset = dk_offset_base + qk_head_idx * stride_dk_head
             dq_ptrs = dQ + dq_offset + offs_s[:, None] * stride_dq_seqlen + offs_d[None, :] * stride_dq_qkdim
@@ -1326,9 +1267,8 @@ def compute_dqktheta(
     dq_bias = dq_bias_partial.sum(dim=(0, 1))
     dk_bias = dk_bias_partial.sum(dim=(0, 1))
 
-    # NOTE: We handle d_ok_state contributions in a different kernel because merging it in 
-    # causes a +800% increase in register spillage and a +200us increase in runtime. For now 
-    # this new kernel only introduces +5us.
+    # d_ok_state contributions live in a separate kernel: merging them here
+    # spills registers (+800%, +200us); the separate kernel costs +5us.
     if d_ok_state is not None:
         apply_dk_state_post(
             d_ok_state, angles, k, k_bias, dk, dk_bias, dangles, Cu_Seqlens
@@ -1402,9 +1342,7 @@ def apply_dk_state_post(
     )
 
 
-# =============================================================================
-# dDT, dTrap, and dInput States Kernel
-# =============================================================================
+# --- dDT, dTrap, and dInput States Kernel ---
 @triton.autotune(
     configs=[
         triton.Config({"CHUNK_SIZE": cs}, num_stages=s, num_warps=w)
@@ -1764,9 +1702,7 @@ def compute_ddt_dtrap_dinput_states(
     return dDT, dTrap, d_Input_SSM_State, d_Input_K_State, d_Input_V_State
 
 
-# =============================================================================
-# Memory Allocator for TMA Descriptors
-# =============================================================================
+# --- Memory Allocator for TMA Descriptors ---
 
 def _alloc_fn(size: int, alignment: int, stream: Optional[int]):
     """Custom allocator for TMA descriptor global memory allocation."""

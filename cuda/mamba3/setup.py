@@ -5,9 +5,9 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 this_dir = Path(__file__).resolve().parent
 
-# gwalk_dual.cu uses tilelang's shipped wgmma_ss
-# descriptor discipline headers; sm_90a is required for wgmma issue.
-import tilelang  # noqa: E402  (build-time dependency, already a project dep)
+# recurrence_jvp.cu uses tilelang's shipped wgmma headers; sm_90a is required
+# for wgmma issue.
+import tilelang  # noqa: E402
 
 _tl_dir = Path(tilelang.__file__).resolve().parent
 tl_includes = [str(_tl_dir / "src"), str(_tl_dir / "3rdparty" / "cutlass" / "include")]
@@ -19,13 +19,9 @@ setup(
             name="mamba3_lbi_cuda",
             sources=[
                 str(this_dir / "binding.cpp"),
-                str(this_dir / "chunkparallel_pass_c_simple.cu"),
-                str(this_dir / "chunkparallel_pass_c_mma.cu"),
-                str(this_dir / "fwd_dualscan_simple.cu"),
-                str(this_dir / "fwd_dualscan_opt.cu"),
-                str(this_dir / "gwalk_dual.cu"),
+                str(this_dir / "recurrence_jvp.cu"),
             ],
-            include_dirs=[str(this_dir)] + tl_includes,
+            include_dirs=[str(this_dir), str(this_dir.parent / "common")] + tl_includes,
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": [

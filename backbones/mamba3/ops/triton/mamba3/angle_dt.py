@@ -10,9 +10,7 @@ import triton.language as tl
 from backbones.mamba3.ops.triton.mamba3.utils import tanh_approx, sech2_approx
 
 
-# -----------------------------------------------------------------------------
-# Forward kernel
-# -----------------------------------------------------------------------------
+# --- Forward kernel ---
 
 @triton.autotune(
     configs=[
@@ -218,9 +216,7 @@ def angle_dt_fwd(
     return out
 
 
-# -----------------------------------------------------------------------------
-# Backward kernel
-# -----------------------------------------------------------------------------
+# --- Backward kernel ---
 
 @triton.autotune(
     configs=[

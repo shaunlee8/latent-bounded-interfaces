@@ -7,7 +7,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from train.config import compatible_output_names_for_variant
+from train.config import output_name_for_variant
 
 
 def checkpoint_dir(run_dir: Path, cfg: Any) -> Path:
@@ -97,7 +97,7 @@ def resolve_checkpoint_path(
     candidates: list[Path] = []
     preferred_name = "latest.pt" if preference == "latest" else "best.pt"
     fallback_name = "best.pt" if preference == "latest" else "latest.pt"
-    compatible_names = compatible_output_names_for_variant(regime)
+    output_name = output_name_for_variant(regime)
     if (source / "metrics.csv").exists():
         candidates.extend(
             [
@@ -106,13 +106,12 @@ def resolve_checkpoint_path(
             ]
         )
     else:
-        for output_name in compatible_names:
-            candidates.extend(
-                [
-                    source / output_name / "checkpoints" / preferred_name,
-                    source / output_name / "checkpoints" / fallback_name,
-                ]
-            )
+        candidates.extend(
+            [
+                source / output_name / "checkpoints" / preferred_name,
+                source / output_name / "checkpoints" / fallback_name,
+            ]
+        )
         candidates.extend(
             [
                 source / "checkpoints" / preferred_name,
@@ -127,10 +126,9 @@ def resolve_checkpoint_path(
         if from_summary is not None:
             return from_summary
     else:
-        for output_name in compatible_output_names_for_variant(regime):
-            from_regime_summary = checkpoint_path_from_summary(source / output_name / "summary.json", preference=preference)
-            if from_regime_summary is not None:
-                return from_regime_summary
+        from_regime_summary = checkpoint_path_from_summary(source / output_name / "summary.json", preference=preference)
+        if from_regime_summary is not None:
+            return from_regime_summary
         from_summary = checkpoint_path_from_summary(source / "summary.json", preference=preference)
         if from_summary is not None:
             return from_summary

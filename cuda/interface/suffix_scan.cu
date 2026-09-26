@@ -80,9 +80,8 @@ torch::Tensor suffix_scan_mats_launcher(torch::Tensor mats) {
         return eye.expand({batch_size, 1, rank, rank}).clone();
     }
 
-    // Store as [K, B, R, R] so each active scan prefix is contiguous across the
-    // flattened (k, b) batch dimension. This lets cuBLAS read/write directly from
-    // persistent buffers without per-level contiguous materialization.
+    // [K, B, R, R] keeps each active scan prefix contiguous over (k, b), so
+    // cuBLAS reads persistent buffers without per-level materialization.
     auto work = mats.to(at::kFloat).permute({1, 0, 2, 3}).contiguous().clone();
     auto next = torch::empty_like(work);
 

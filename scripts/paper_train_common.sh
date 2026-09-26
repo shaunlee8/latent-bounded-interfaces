@@ -1,6 +1,5 @@
-# Shared body for the paper training launchers; sourced with VARIANT=dense|lbi
-# set by the wrapper. Positional args: [OUTPUT_ROOT] [BACKBONE], then
-# passthrough flags for train.lbi. Every knob is an environment override.
+# Shared body for the paper training launchers (VARIANT=dense|lbi set by the
+# wrapper); positional args [OUTPUT_ROOT] [BACKBONE], knobs via environment.
 
 if [[ "${VARIANT}" != "dense" && "${VARIANT}" != "lbi" ]]; then
   echo "VARIANT must be dense or lbi, got '${VARIANT}'" >&2
@@ -40,86 +39,43 @@ EVAL_BATCHES="${EVAL_BATCHES:-4}"
 LOG_EVERY="${LOG_EVERY:-20}"
 SAVE_EVERY="${SAVE_EVERY:-5000}"
 TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-true}"
-TOKENIZER_TYPE="${TOKENIZER_TYPE:-llama}"
 VOCAB_SIZE="${VOCAB_SIZE:-32000}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-}"
 if [[ "${VARIANT}" == "lbi" ]]; then
   REGION_SIZE="${REGION_SIZE:-2}"
-  # Defaults: guarded attentive interface, strict causal chunks
-  # (MESSAGE_DIM per chunk), tanh-bounded output readout.
-  MESSAGE_DIM="${MESSAGE_DIM:-2}"
+  # Defaults are the paper configuration: two blocks per region, rank 16.
+  MESSAGE_DIM="${MESSAGE_DIM:-16}"
   MESSAGE_HIDDEN_DIM="${MESSAGE_HIDDEN_DIM:-0}"
   MESSAGE_SCALE_INIT="${MESSAGE_SCALE_INIT:-0.5}"
-  INTERFACE_TYPE="${INTERFACE_TYPE:-attentive}"
-  INTERFACE_ATTN_DIM="${INTERFACE_ATTN_DIM:-64}"
-  CANVAS_STATE_READOUT="${CANVAS_STATE_READOUT:-false}"
-  CANVAS_REGION_VIEW="${CANVAS_REGION_VIEW:-false}"
-  CANVAS_LOCAL_MIXER="${CANVAS_LOCAL_MIXER:-0}"
-  CANVAS_OUTPUT_READOUT="${CANVAS_OUTPUT_READOUT:-true}"
-  INTERFACE_CHUNKS="${INTERFACE_CHUNKS:-4}"
-  INTERFACE_CHUNKS_STRICT="${INTERFACE_CHUNKS_STRICT:-true}"
-  INTERFACE_CHUNK_NORM="${INTERFACE_CHUNK_NORM:-layer}"
+  INTERFACE_TYPE="${INTERFACE_TYPE:-vector_mlp}"
 fi
 if [[ -z "${LR_MODEL+x}" ]]; then
-  case "${MODEL_SCALE}:${BACKBONE}" in
-    canonical:mamba2)
-      LR_MODEL="8e-4"
-      ;;
-    canonical:mamba3)
-      # Swept operating point for the guarded attentive interface.
-      LR_MODEL="6e-4"
-      ;;
-    canonical:hybrid)
-      if [[ "${VARIANT}" == "lbi" && ( "${MESSAGE_DIM}" == "32" || "${MESSAGE_DIM}" == "64" ) ]]; then
-        LR_MODEL="3e-4"
-      else
-        LR_MODEL="6e-4"
-      fi
-      ;;
-    *:mamba2|*:transformer)
-      LR_MODEL="6e-4"
-      ;;
-    *)
-      LR_MODEL="3e-4"
-      ;;
-  esac
+  # Table 1 peak learning rates; every printed row sets LR_MODEL explicitly.
+  if [[ "${VARIANT}" == "dense" && "${BACKBONE}" == "hybrid" ]]; then
+    LR_MODEL="1.2e-3"
+  else
+    LR_MODEL="6e-4"
+  fi
 fi
 LR_SCHEDULE="${LR_SCHEDULE:-cosine}"
-if [[ -z "${WARMUP_STEPS+x}" ]]; then
-  case "${MODEL_SCALE}:${BACKBONE}" in
-    canonical:mamba3|canonical:hybrid)
-      WARMUP_STEPS="500"
-      ;;
-    *)
-      WARMUP_STEPS="1000"
-      ;;
-  esac
-fi
+WARMUP_STEPS="${WARMUP_STEPS:-1000}"
+LR_SCHEDULE_STEPS="${LR_SCHEDULE_STEPS:-0}"
 MIN_LR_RATIO="${MIN_LR_RATIO:-0.1}"
 if [[ -z "${WEIGHT_DECAY+x}" ]]; then
-  case "${MODEL_SCALE}:${BACKBONE}" in
-    canonical:mamba2|canonical:mamba3|canonical:hybrid)
-      WEIGHT_DECAY="0.03"
-      ;;
-    *:mamba3)
-      WEIGHT_DECAY="0.1"
-      ;;
-    *)
-      WEIGHT_DECAY="0.01"
-      ;;
-  esac
+  if [[ "${BACKBONE}" == "mamba3" ]]; then
+    WEIGHT_DECAY="0.03"
+  else
+    WEIGHT_DECAY="0.01"
+  fi
 fi
 GRAD_CLIP="${GRAD_CLIP:-1.0}"
 if [[ "${VARIANT}" == "lbi" ]]; then
-  # Forward-mode kernel construction + native local VJPs: the fastest
-  # exact engine at training scale.
+  # The printed training rows use the autograd engine; LBI_BACKWARD=scan
+  # NATIVE_BACKWARD=true selects the forward-mode construction with native
+  # local VJPs.
   INTERFACE_JACOBIAN_MODE="${INTERFACE_JACOBIAN_MODE:-forward}"
-  JACOBIAN_BASIS_CHUNK="${JACOBIAN_BASIS_CHUNK:-32}"
-  LBI_BACKWARD="${LBI_BACKWARD:-scan}"
-  NATIVE_BACKWARD="${NATIVE_BACKWARD:-true}"
-  COMPILE_TURN="${COMPILE_TURN:-false}"
-else
-  COMPILE_DENSE="${COMPILE_DENSE:-false}"
+  LBI_BACKWARD="${LBI_BACKWARD:-autograd}"
+  NATIVE_BACKWARD="${NATIVE_BACKWARD:-false}"
 fi
 
 step_tag() {
@@ -134,13 +90,7 @@ step_tag() {
 }
 
 STEP_TAG="$(step_tag "${TARGET_STEPS}")"
-if [[ "${TOKENIZER_TYPE}" == "llama" && "${VOCAB_SIZE}" == "32000" ]]; then
-  TOKENIZER_TAG="llama32k"
-elif [[ "${TOKENIZER_TYPE}" == "llama31" ]]; then
-  TOKENIZER_TAG="llama31"
-else
-  TOKENIZER_TAG="${TOKENIZER_TYPE}${VOCAB_SIZE}"
-fi
+TOKENIZER_TAG="llama32k"
 if [[ "${TIE_EMBEDDINGS}" == "true" || "${TIE_EMBEDDINGS}" == "1" || "${TIE_EMBEDDINGS}" == "yes" ]]; then
   TIE_TAG="tied"
 else
@@ -161,29 +111,31 @@ if [[ "${TARGET_STEPS}" -le 0 ]]; then
 fi
 if [[ "${VARIANT}" == "lbi" ]]; then
   case "${INTERFACE_JACOBIAN_MODE}" in
-    graph|recompute|native|forward) ;;
+    graph|forward) ;;
     *)
-      echo "INTERFACE_JACOBIAN_MODE must be graph, recompute, native, or forward; got '${INTERFACE_JACOBIAN_MODE}'" >&2
+      echo "INTERFACE_JACOBIAN_MODE must be graph or forward; got '${INTERFACE_JACOBIAN_MODE}'" >&2
       exit 1
       ;;
   esac
-  if [[ "${JACOBIAN_BASIS_CHUNK}" -le 0 ]]; then
-    echo "JACOBIAN_BASIS_CHUNK must be > 0" >&2
-    exit 1
-  fi
   if [[ "${LBI_BACKWARD}" != "scan" && "${LBI_BACKWARD}" != "autograd" ]]; then
     echo "LBI_BACKWARD must be scan or autograd, got '${LBI_BACKWARD}'" >&2
     exit 1
   fi
 fi
-if [[ "${MODEL_SCALE}" != "canonical" && "${MODEL_SCALE}" != "large" ]]; then
-  echo "MODEL_SCALE must be canonical or large, got '${MODEL_SCALE}'" >&2
+if [[ "${MODEL_SCALE}" != "canonical" && "${MODEL_SCALE}" != "mid" && "${MODEL_SCALE}" != "large" && "${MODEL_SCALE}" != "matched" ]]; then
+  echo "MODEL_SCALE must be canonical, mid, large, or matched, got '${MODEL_SCALE}'" >&2
   exit 1
 fi
 
 case "${MODEL_SCALE}:${BACKBONE}" in
-  canonical:mamba2|canonical:mamba3)
+  canonical:mamba3)
     ARCH_TAG="14l_768d"
+    ;;
+  mid:mamba3)
+    ARCH_TAG="18l_1024d"
+    ;;
+  large:mamba3)
+    ARCH_TAG="48l_1024d"
     ;;
   canonical:transformer)
     ARCH_TAG="12l_512d"
@@ -191,17 +143,17 @@ case "${MODEL_SCALE}:${BACKBONE}" in
   canonical:hybrid)
     ARCH_TAG="12l_768d"
     ;;
-  large:mamba2|large:mamba3)
-    ARCH_TAG="28l_768d"
+  mid:transformer)
+    ARCH_TAG="10l_1024d"
     ;;
-  large:transformer)
-    ARCH_TAG="12l_768d"
+  mid:hybrid)
+    ARCH_TAG="16l_1024d"
     ;;
-  large:hybrid)
-    ARCH_TAG="20l_768d"
+  matched:mamba3)
+    ARCH_TAG="16l_768d"
     ;;
   *)
-    echo "Unsupported BACKBONE='${BACKBONE}'. Expected one of: mamba2, mamba3, transformer, hybrid" >&2
+    echo "Unsupported BACKBONE='${BACKBONE}'. Expected one of: mamba3, transformer, hybrid" >&2
     exit 1
     ;;
 esac
@@ -226,9 +178,7 @@ COMMON_ARGS=(
   --output-dir "${OUTPUT_DIR}"
   --run-name "${RUN_NAME}"
   --seed "${SEED}"
-  --data-mode text_bpe_sharded
   --text-corpus fineweb_edu
-  --tokenizer-type "${TOKENIZER_TYPE}"
   --vocab-size "${VOCAB_SIZE}"
   --seq-len "${SEQ_LEN}"
   --batch-size "${BATCH_SIZE}"
@@ -240,6 +190,7 @@ COMMON_ARGS=(
   --lr-model "${LR_MODEL}"
   --lr-schedule "${LR_SCHEDULE}"
   --warmup-steps "${WARMUP_STEPS}"
+  --lr-schedule-steps "${LR_SCHEDULE_STEPS}"
   --min-lr-ratio "${MIN_LR_RATIO}"
   --weight-decay "${WEIGHT_DECAY}"
   --grad-clip "${GRAD_CLIP}"
@@ -251,35 +202,17 @@ if [[ "${VARIANT}" == "lbi" ]]; then
     --message-hidden-dim "${MESSAGE_HIDDEN_DIM}"
     --message-scale-init "${MESSAGE_SCALE_INIT}"
     --interface-type "${INTERFACE_TYPE}"
-    --interface-attn-dim "${INTERFACE_ATTN_DIM}"
     --interface-jacobian-mode "${INTERFACE_JACOBIAN_MODE}"
-    --jacobian-basis-chunk "${JACOBIAN_BASIS_CHUNK}"
     --lbi-backward "${LBI_BACKWARD}"
   )
-  COMMON_ARGS+=(--canvas-local-mixer "${CANVAS_LOCAL_MIXER}")
-  COMMON_ARGS+=(--interface-chunks "${INTERFACE_CHUNKS}")
-  COMMON_ARGS+=(--interface-chunk-norm "${INTERFACE_CHUNK_NORM}")
-  if [[ "${INTERFACE_CHUNKS_STRICT}" == "true" || "${INTERFACE_CHUNKS_STRICT}" == "1" ]]; then
-    COMMON_ARGS+=(--interface-chunks-strict)
+  if [[ -n "${CANVAS_GRAD_WINDOW:-}" && "${CANVAS_GRAD_WINDOW:-0}" != "0" ]]; then
+    COMMON_ARGS+=(--canvas-grad-window "${CANVAS_GRAD_WINDOW}")
   fi
-  if [[ "${CANVAS_OUTPUT_READOUT}" == "true" || "${CANVAS_OUTPUT_READOUT}" == "1" ]]; then
-    COMMON_ARGS+=(--canvas-output-readout)
-  fi
-  if [[ "${CANVAS_STATE_READOUT}" == "true" || "${CANVAS_STATE_READOUT}" == "1" ]]; then
-    COMMON_ARGS+=(--canvas-state-readout)
-  fi
-  if [[ "${CANVAS_REGION_VIEW}" == "true" || "${CANVAS_REGION_VIEW}" == "1" ]]; then
-    COMMON_ARGS+=(--canvas-region-view)
+  if [[ -n "${CANVAS_GRAD_WINDOW_LR_MULT:-}" && "${CANVAS_GRAD_WINDOW_LR_MULT:-1}" != "1" ]]; then
+    COMMON_ARGS+=(--canvas-grad-window-lr-mult "${CANVAS_GRAD_WINDOW_LR_MULT}")
   fi
   if [[ "${NATIVE_BACKWARD}" == "true" || "${NATIVE_BACKWARD}" == "1" ]]; then
     COMMON_ARGS+=(--native-backward)
-  fi
-  if [[ "${COMPILE_TURN}" == "true" || "${COMPILE_TURN}" == "1" ]]; then
-    COMMON_ARGS+=(--compile-turn)
-  fi
-else
-  if [[ "${COMPILE_DENSE}" == "true" || "${COMPILE_DENSE}" == "1" ]]; then
-    COMMON_ARGS+=(--compile-dense)
   fi
 fi
 if [[ "${TIE_EMBEDDINGS}" == "true" || "${TIE_EMBEDDINGS}" == "1" || "${TIE_EMBEDDINGS}" == "yes" ]]; then
@@ -298,24 +231,40 @@ if [[ -n "${TOKENIZER_PATH}" ]]; then
 fi
 
 case "${MODEL_SCALE}:${BACKBONE}" in
-  canonical:mamba2)
-    BACKBONE_ARGS=(
-      --layers 14
-      --dim 768
-      --d-state 64
-      --d-conv 4
-      --expand 2
-      --headdim 64
-      --ngroups 1
-      --chunk-size 128
-    )
-    ;;
   canonical:mamba3)
     BACKBONE_ARGS=(
       --device cuda
       --dtype bfloat16
       --layers 14
       --dim 768
+      --d-state 128
+      --expand 2
+      --headdim 64
+      --ngroups 1
+      --chunk-size 64
+    )
+    ;;
+  # Paper quality scales: canonical 14L/768d (54M), mid 18L/1024d (120M),
+  # large 48L/1024d (321M).
+  mid:mamba3)
+    BACKBONE_ARGS=(
+      --device cuda
+      --dtype bfloat16
+      --layers 18
+      --dim 1024
+      --d-state 128
+      --expand 2
+      --headdim 64
+      --ngroups 1
+      --chunk-size 64
+    )
+    ;;
+  large:mamba3)
+    BACKBONE_ARGS=(
+      --device cuda
+      --dtype bfloat16
+      --layers 48
+      --dim 1024
       --d-state 128
       --expand 2
       --headdim 64
@@ -333,69 +282,59 @@ case "${MODEL_SCALE}:${BACKBONE}" in
       --d-intermediate 2048
     )
     ;;
+  mid:transformer)
+    BACKBONE_ARGS=(
+      --device cuda
+      --dtype bfloat16
+      --layers 10
+      --dim 1024
+      --n-heads 16
+      --n-kv-heads 8
+      --attn-head-dim 64
+      --d-intermediate 4096
+    )
+    ;;
+  mid:hybrid)
+    BACKBONE_ARGS=(
+      --device cuda
+      --dtype bfloat16
+      --layers 16
+      --dim 1024
+      --d-state 128
+      --expand 2
+      --headdim 64
+      --ngroups 1
+      --chunk-size 64
+      --n-heads 16
+      --n-kv-heads 8
+      --attn-head-dim 64
+      --d-intermediate 4096
+    )
+    ;;
+  # Dense matched on the bounded-interface model's total parameters: 16 blocks
+  # at 768d; the parameter-matched control of Appendix D, dense variant only.
+  matched:mamba3)
+    BACKBONE_ARGS=(
+      --device cuda
+      --dtype bfloat16
+      --layers 16
+      --dim 768
+      --d-state 128
+      --expand 2
+      --headdim 64
+      --ngroups 1
+      --chunk-size 64
+    )
+    ;;
+  # Printed hybrid: 12 layers at 768d, repeating 3x mamba3 + 1x transformer
+  # (the builder's default pattern). Autograd-only (no mixed-region engines).
   canonical:hybrid)
     BACKBONE_ARGS=(
       --device cuda
       --dtype bfloat16
       --layers 12
-      --layer-types "mamba3,mamba3,mamba3,transformer,mamba3,mamba3,mamba3,transformer,mamba3,mamba3,mamba3,transformer"
       --dim 768
       --d-state 128
-      --d-conv 4
-      --expand 2
-      --headdim 64
-      --ngroups 1
-      --chunk-size 64
-      --n-heads 12
-      --n-kv-heads 6
-      --attn-head-dim 64
-      --d-intermediate 3072
-    )
-    ;;
-  large:mamba2)
-    BACKBONE_ARGS=(
-      --layers 28
-      --dim 768
-      --d-state 64
-      --d-conv 4
-      --expand 2
-      --headdim 64
-      --ngroups 1
-      --chunk-size 128
-    )
-    ;;
-  large:mamba3)
-    BACKBONE_ARGS=(
-      --device cuda
-      --dtype bfloat16
-      --layers 28
-      --dim 768
-      --d-state 128
-      --expand 2
-      --headdim 64
-      --ngroups 1
-      --chunk-size 64
-    )
-    ;;
-  large:transformer)
-    BACKBONE_ARGS=(
-      --layers 12
-      --dim 768
-      --n-heads 12
-      --n-kv-heads 6
-      --attn-head-dim 64
-      --d-intermediate 3072
-    )
-    ;;
-  large:hybrid)
-    BACKBONE_ARGS=(
-      --device cuda
-      --dtype bfloat16
-      --layers 20
-      --layer-types "mamba3,mamba3,mamba3,transformer,mamba3,mamba3,mamba3,transformer,mamba3,mamba3,mamba3,transformer,mamba3,mamba3,mamba3,transformer,mamba3,mamba3,mamba3,transformer"
-      --dim 768
-      --d-state 128
-      --d-conv 4
       --expand 2
       --headdim 64
       --ngroups 1
@@ -407,7 +346,7 @@ case "${MODEL_SCALE}:${BACKBONE}" in
     )
     ;;
   *)
-    echo "Unsupported BACKBONE='${BACKBONE}'. Expected one of: mamba2, mamba3, transformer, hybrid" >&2
+    echo "Unsupported BACKBONE='${BACKBONE}'. Expected one of: mamba3, transformer, hybrid" >&2
     exit 1
     ;;
 esac
@@ -431,19 +370,17 @@ echo "Tie tag: ${TIE_TAG}"
 echo "Peak LR: ${LR_MODEL}"
 echo "LR schedule: ${LR_SCHEDULE}"
 echo "Warmup steps: ${WARMUP_STEPS}"
+echo "LR schedule steps: ${LR_SCHEDULE_STEPS} (0 = follow target steps)"
 echo "Min LR ratio: ${MIN_LR_RATIO}"
 echo "Weight decay: ${WEIGHT_DECAY}"
 echo "Tie embeddings: ${TIE_EMBEDDINGS}"
-echo "Tokenizer type: ${TOKENIZER_TYPE}"
 echo "Tokenizer path: ${TOKENIZER_PATH:-<default>}"
 echo "Requested vocab size: ${VOCAB_SIZE}"
 if [[ "${VARIANT}" == "lbi" ]]; then
   echo "Region size: ${REGION_SIZE}"
   echo "Message dim: ${MESSAGE_DIM}"
   echo "Interface type: ${INTERFACE_TYPE}"
-  echo "Canvas: state_readout=${CANVAS_STATE_READOUT} region_view=${CANVAS_REGION_VIEW} local_mixer=${CANVAS_LOCAL_MIXER}"
   echo "Interface Jacobian mode: ${INTERFACE_JACOBIAN_MODE}"
-  echo "Jacobian basis chunk: ${JACOBIAN_BASIS_CHUNK}"
   echo "LBI backward: ${LBI_BACKWARD}"
   if [[ "${MESSAGE_HIDDEN_DIM}" -eq 0 ]]; then
     echo "Message hidden dim: infer from model dim"

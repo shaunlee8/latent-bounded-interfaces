@@ -5,28 +5,36 @@ from typing import Any
 import torch.nn as nn
 
 from backbones.general import BackboneSpec, infer_message_hidden_dim
-from interfaces.attentive import AttentiveInterface
-from interfaces.base import InterfaceModule
 from interfaces.vector_mlp import VectorMLPInterface
 from models.dense_language_model import DenseLanguageModel
 from models.lbi_language_model import LBILanguageModel, build_region_ranges
-from train.config import LEGACY_DENSE_REGIME, LEGACY_LBI_REGIME, normalize_regime_name
+from train.config import DENSE_VARIANT, LBI_VARIANT, normalize_model_variant
 
 
 def build_backbone_spec(cfg: Any) -> BackboneSpec:
-    layer_types = tuple(t.strip() for t in cfg.layer_types.split(",") if t.strip())
+    layer_types = None
+    if cfg.backbone == "hybrid":
+        raw = str(getattr(cfg, "layer_types", "") or "").strip()
+        if raw:
+            layer_types = tuple(t.strip() for t in raw.split(",") if t.strip())
+        else:
+            if cfg.layers % 4 != 0:
+                raise ValueError(
+                    "hybrid default pattern (3x mamba3 + 1x transformer) requires layers "
+                    "divisible by 4; set layer_types explicitly otherwise"
+                )
+            layer_types = ("mamba3", "mamba3", "mamba3", "transformer") * (cfg.layers // 4)
     spec = BackboneSpec(
         name=cfg.backbone,
+        layer_types=layer_types,
         dim=cfg.dim,
         layers=cfg.layers,
         d_state=cfg.d_state,
-        dt_rank=cfg.dt_rank,
         expand=cfg.expand,
         d_conv=cfg.d_conv,
         headdim=cfg.headdim,
         ngroups=cfg.ngroups,
         chunk_size=cfg.chunk_size,
-        use_mem_eff_path=cfg.use_mem_eff_path,
         n_heads=cfg.n_heads,
         n_kv_heads=cfg.n_kv_heads,
         mlp_ratio=cfg.mlp_ratio,
@@ -38,7 +46,6 @@ def build_backbone_spec(cfg: Any) -> BackboneSpec:
         use_flash_attn=cfg.use_flash_attn,
         residual_in_fp32=cfg.residual_in_fp32,
         fused_add_norm=cfg.fused_add_norm,
-        layer_types=layer_types,
     )
     spec.validate()
     return spec
@@ -50,36 +57,11 @@ def build_dense_model(cfg: Any, *, backbone_spec: BackboneSpec | None = None) ->
     return DenseLanguageModel(
         vocab_size=int(cfg.vocab_size),
         backbone_spec=backbone_spec,
-        tie_embeddings=bool(getattr(cfg, "tie_embeddings", False)),
+        tie_embeddings=bool(cfg.tie_embeddings),
     )
 
 
-def build_interface(cfg: Any, *, backbone_spec: BackboneSpec, num_regions: int) -> InterfaceModule:
-    interface_type = str(getattr(cfg, "interface_type", "vector_mlp"))
-    chunks = int(getattr(cfg, "interface_chunks", 1))
-    if interface_type == "attentive" and chunks > 1:
-        from interfaces.chunked import ChunkedAttentiveInterface
-
-        return ChunkedAttentiveInterface(
-            feature_dim=backbone_spec.dim,
-            num_regions=num_regions,
-            chunk_count=chunks,
-            chunk_width=int(cfg.message_dim),
-            attn_dim=int(getattr(cfg, "interface_attn_dim", 64)),
-            update_scale_init=float(cfg.message_scale_init),
-            strict_causal=bool(getattr(cfg, "interface_chunks_strict", False)),
-            chunk_norm=str(getattr(cfg, "interface_chunk_norm", "layer")),
-        )
-    if interface_type == "attentive":
-        return AttentiveInterface(
-            feature_dim=backbone_spec.dim,
-            num_regions=num_regions,
-            interface_width=int(cfg.message_dim),
-            attn_dim=int(getattr(cfg, "interface_attn_dim", 64)),
-            update_scale_init=float(cfg.message_scale_init),
-        )
-    if interface_type != "vector_mlp":
-        raise ValueError(f"unsupported interface_type: {interface_type}")
+def build_interface(cfg: Any, *, backbone_spec: BackboneSpec, num_regions: int) -> VectorMLPInterface:
     return VectorMLPInterface(
         feature_dim=backbone_spec.dim,
         num_regions=num_regions,
@@ -89,7 +71,8 @@ def build_interface(cfg: Any, *, backbone_spec: BackboneSpec, num_regions: int) 
     )
 
 
-def build_lbi_language_model(cfg: Any, *, backbone_spec: BackboneSpec | None = None) -> LBILanguageModel:
+def build_lbi_model(cfg: Any, *, backbone_spec: BackboneSpec | None = None) -> LBILanguageModel:
+    """Build the LBI language model used by training and evaluation."""
     if backbone_spec is None:
         backbone_spec = build_backbone_spec(cfg)
     region_ranges = build_region_ranges(backbone_spec.layers, int(cfg.region_size))
@@ -99,69 +82,15 @@ def build_lbi_language_model(cfg: Any, *, backbone_spec: BackboneSpec | None = N
         layers_per_region=int(cfg.region_size),
         backbone_spec=backbone_spec,
         interface=interface,
-        tie_embeddings=bool(getattr(cfg, "tie_embeddings", False)),
-        canvas_local_mixer=int(getattr(cfg, "canvas_local_mixer", 0)),
-        canvas_region_view=bool(getattr(cfg, "canvas_region_view", False)),
-        canvas_state_readout=bool(getattr(cfg, "canvas_state_readout", False)),
-        canvas_output_readout=bool(getattr(cfg, "canvas_output_readout", False)),
-        state_readout_attn_dim=int(getattr(cfg, "interface_attn_dim", 64)),
+        tie_embeddings=bool(cfg.tie_embeddings),
     )
 
 
-def build_legacy_lbi_model(cfg: Any, *, backbone_spec: BackboneSpec | None = None) -> nn.Module:
-    """Build a checkpoint-compatible model for state dictionaries with historical key names."""
-    from legacy.native_region_interface import NativeRegionInterfaceModel
-
-    if backbone_spec is None:
-        backbone_spec = build_backbone_spec(cfg)
-    return NativeRegionInterfaceModel(
-        vocab_size=int(cfg.vocab_size),
-        region_size=int(cfg.region_size),
-        message_dim=int(cfg.message_dim),
-        backbone_spec=backbone_spec,
-        message_hidden_dim=infer_message_hidden_dim(backbone_spec, int(cfg.message_hidden_dim)),
-        message_scale_init=float(cfg.message_scale_init),
-        tie_embeddings=bool(getattr(cfg, "tie_embeddings", False)),
-    )
-
-
-def build_lbi_model(cfg: Any, *, backbone_spec: BackboneSpec | None = None) -> LBILanguageModel:
-    """Build the LBI language model used by training and evaluation."""
-    return build_lbi_language_model(cfg, backbone_spec=backbone_spec)
-
-
-def checkpoint_uses_owned_lbi(checkpoint: dict[str, Any]) -> bool:
-    state_dict = checkpoint.get("model_state_dict", {})
-    return any(str(key).startswith("interface.") for key in state_dict.keys())
-
-
-def checkpoint_uses_legacy_lbi(checkpoint: dict[str, Any]) -> bool:
-    state_dict = checkpoint.get("model_state_dict", {})
-    has_owned_interface = any(str(key).startswith("interface.") for key in state_dict.keys())
-    has_legacy_interface = any(
-        str(key).startswith(("input_to_message.", "message_to_hidden.", "hidden_to_message.", "message_norm.", "message_alpha"))
-        for key in state_dict.keys()
-    )
-    return has_legacy_interface and not has_owned_interface
-
-
-def build_model_for_regime(
-    cfg: Any,
-    *,
-    checkpoint: dict[str, Any] | None = None,
-    use_legacy_lbi_checkpoint: bool | None = None,
-    use_owned_lbi: bool | None = None,
-) -> nn.Module:
-    """Build the model variant requested by the training or evaluation configuration."""
-    backbone_spec = build_backbone_spec(cfg)
-    if normalize_regime_name(cfg.regime) == LEGACY_DENSE_REGIME:
-        return build_dense_model(cfg, backbone_spec=backbone_spec)
-    if normalize_regime_name(cfg.regime) == LEGACY_LBI_REGIME:
-        if use_owned_lbi is not None:
-            use_legacy_lbi_checkpoint = not bool(use_owned_lbi)
-        elif use_legacy_lbi_checkpoint is None and checkpoint is not None:
-            use_legacy_lbi_checkpoint = checkpoint_uses_legacy_lbi(checkpoint)
-        if use_legacy_lbi_checkpoint:
-            return build_legacy_lbi_model(cfg, backbone_spec=backbone_spec)
-        return build_lbi_model(cfg, backbone_spec=backbone_spec)
+def build_model_for_regime(cfg: Any) -> nn.Module:
+    """Build the dense or LBI model named by `cfg.regime`."""
+    variant = normalize_model_variant(cfg.regime)
+    if variant == DENSE_VARIANT:
+        return build_dense_model(cfg)
+    if variant == LBI_VARIANT:
+        return build_lbi_model(cfg)
     raise ValueError(f"unsupported model regime: {cfg.regime}")

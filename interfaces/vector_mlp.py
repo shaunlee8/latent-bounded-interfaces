@@ -1,67 +1,20 @@
+"""The paper's bounded interface: mean-pool encode of the region output into a
+rank-r state, broadcast MLP decode into the next region, and a normalized
+residual update, with the structured Jacobian applications of both maps."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from collections.abc import Sequence
 from typing import Any
 
 import torch
 import torch.nn as nn
 
-from .base import InterfaceModule, InterfaceSpec, InterfaceStep
-
-
-class VectorMLPHead(nn.Module):
-    """MLP interface map used by the vector interface representation."""
-
-    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 0) -> None:
-        super().__init__()
-        if hidden_dim > 0:
-            self.net = nn.Sequential(
-                nn.Linear(in_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, out_dim),
-            )
-        else:
-            self.net = nn.Linear(in_dim, out_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        param = next(self.net.parameters(), None)
-        if param is not None and x.dtype != param.dtype:
-            x = x.to(dtype=param.dtype)
-        return self.net(x)
-
-
-def _module_input_jacobian_t_apply_autograd(
-    module: nn.Module,
-    x: torch.Tensor,
-    g_out: torch.Tensor,
-) -> torch.Tensor:
-    if x.dim() != 2:
-        raise ValueError("module input Jacobian-transpose apply expects x shaped [B, D].")
-    if g_out.dim() != 3:
-        raise ValueError("module input Jacobian-transpose apply expects g_out shaped [B, P, D_out].")
-    bsz, basis = g_out.shape[:2]
-    # This helper builds its own local graph, so it must work even when the
-    # caller runs under no_grad (the structured-pullback providers do).
-    with torch.enable_grad():
-        x_rep = (
-            x.detach()
-            .unsqueeze(1)
-            .expand(bsz, basis, x.shape[-1])
-            .reshape(bsz * basis, x.shape[-1])
-            .requires_grad_(True)
-        )
-        y_rep = module(x_rep)
-        g_rep = g_out.to(device=y_rep.device, dtype=y_rep.dtype).reshape_as(y_rep)
-        g_in = torch.autograd.grad(
-            y_rep,
-            x_rep,
-            grad_outputs=g_rep,
-            retain_graph=False,
-            create_graph=False,
-            allow_unused=False,
-        )[0]
-    return g_in.reshape(bsz, basis, x.shape[-1]).to(device=g_out.device, dtype=g_out.dtype)
+from interfaces.base import InterfaceModule, InterfaceSpec, InterfaceStep
+from interfaces.jacobians import (
+    _layernorm_input_jacobian_apply,
+    _module_input_jacobian_t_apply_autograd,
+)
+from interfaces.mlp_head import VectorMLPHead
 
 
 def _linear_input_jacobian_t_apply(linear: nn.Linear, g_out: torch.Tensor) -> torch.Tensor:
@@ -126,9 +79,7 @@ def _broadcast_condition_jacobian_t_apply(g_region_input: torch.Tensor) -> torch
     return g_region_input.sum(dim=2)
 
 
-# Forward-mode (JVP) counterparts of the transpose helpers above: each pushes
-# an input tangent through one interface primitive, the exact adjoint of the
-# matching `_jacobian_t_apply`. Together they assemble the interface Jacobian
+# JVP counterparts of the transpose helpers: together they assemble
 # A_k = skip + encode . J_region . decode applied to the identity basis.
 
 
@@ -168,9 +119,8 @@ def _interface_map_input_jacobian_apply(
         linear1, act, linear2 = net
         if not isinstance(linear1, nn.Linear) or not isinstance(act, nn.SiLU) or not isinstance(linear2, nn.Linear):
             raise TypeError("unsupported vector interface map sequential structure")
-        # The primal replay runs in the module weight dtype, as the forward
-        # does; an fp32 residual stream would otherwise crash the bf16 GEMM.
-        # The tangent einsum and SiLU derivative promote internally.
+        # The primal replay runs in the module weight dtype (as the forward);
+        # the tangent einsum and SiLU derivative promote internally.
         hidden_pre = linear1(x.to(device=linear1.weight.device, dtype=linear1.weight.dtype))
         d_hidden_pre = _linear_input_jacobian_apply(linear1, d_in)
         d_hidden = _silu_input_jacobian_apply(hidden_pre, d_hidden_pre.to(dtype=hidden_pre.dtype))
@@ -191,35 +141,6 @@ def _broadcast_condition_jacobian_apply(d_condition: torch.Tensor, seq_len: int)
     if seq_len <= 0:
         raise ValueError("seq_len must be positive.")
     return d_condition.unsqueeze(2).expand(-1, -1, seq_len, -1)
-
-
-def _layernorm_input_jacobian_apply(
-    norm: nn.LayerNorm,
-    x: torch.Tensor,
-    d_in: torch.Tensor,
-) -> torch.Tensor:
-    """Forward-mode JVP of LayerNorm w.r.t. its input (affine bias drops out)."""
-    if x.dim() != 2:
-        raise ValueError("LayerNorm input Jacobian apply expects x shaped [B, D].")
-    if d_in.dim() != 3:
-        raise ValueError("LayerNorm input Jacobian apply expects d_in shaped [B, P, D].")
-    compute_dtype = torch.promote_types(x.dtype, d_in.dtype)
-    x_c = x.to(device=d_in.device, dtype=compute_dtype)
-    d_c = d_in.to(dtype=compute_dtype)
-    eps = float(norm.eps)
-    mean = x_c.mean(-1, keepdim=True)
-    x_centered = x_c - mean                                     # [B, D]
-    var = (x_centered * x_centered).mean(-1, keepdim=True)      # [B, 1]
-    istd = torch.rsqrt(var + eps)                               # [B, 1]
-    d_mean = d_c.mean(-1, keepdim=True)                         # [B, P, 1]
-    d_centered = d_c - d_mean                                   # [B, P, D]
-    d_var = 2.0 * (x_centered.unsqueeze(1) * d_centered).mean(-1, keepdim=True)  # [B, P, 1]
-    d_istd = -0.5 * istd.unsqueeze(1).pow(3) * d_var            # [B, P, 1]
-    d_norm = d_centered * istd.unsqueeze(1) + x_centered.unsqueeze(1) * d_istd
-    weight = norm.weight.to(device=d_in.device, dtype=compute_dtype) if norm.weight is not None else None
-    if weight is not None:
-        d_norm = d_norm * weight.view(1, 1, -1)
-    return d_norm.to(device=d_in.device, dtype=d_in.dtype)
 
 
 class VectorMLPInterface(InterfaceModule):
@@ -246,7 +167,6 @@ class VectorMLPInterface(InterfaceModule):
         if update_scale_init <= 0.0:
             raise ValueError("update_scale_init must be > 0")
         self.spec = InterfaceSpec(
-            state_shape=(interface_width,),
             state_flat_dim=interface_width,
             region_condition_dim=feature_dim,
         )
@@ -283,14 +203,7 @@ class VectorMLPInterface(InterfaceModule):
     def initialize(self, canvas_features: torch.Tensor) -> torch.Tensor:
         return self.initial_encoder(self.summarize_features(canvas_features))
 
-    def decode(
-        self,
-        state: torch.Tensor,
-        region_index: int,
-        *,
-        canvas_features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        del canvas_features
+    def decode(self, state: torch.Tensor, region_index: int) -> torch.Tensor:
         return self.decoders[region_index](state)
 
     def update(
@@ -436,68 +349,3 @@ class VectorMLPInterface(InterfaceModule):
             "d_state_out": d_state_out,
         }
 
-
-@dataclass
-class LegacyInterfaceUpdate:
-    state: torch.Tensor
-    pooled_region_output: torch.Tensor
-    delta_state: torch.Tensor
-    update_scale: torch.Tensor
-    pre_norm_state: torch.Tensor
-
-
-class LegacyVectorMLPInterfaceView(nn.Module):
-    """Adapter exposing the vector-interface formulas over externally supplied modules."""
-
-    def __init__(
-        self,
-        *,
-        interface_width: int,
-        initial_encoder: nn.Module,
-        decoders: Sequence[nn.Module],
-        encoders: Sequence[nn.Module],
-        norms: Sequence[nn.Module],
-    ) -> None:
-        super().__init__()
-        if interface_width <= 0:
-            raise ValueError("interface_width must be > 0")
-        if not (len(decoders) == len(encoders) == len(norms)):
-            raise ValueError("interface region module counts must match")
-        self.interface_width = int(interface_width)
-        object.__setattr__(self, "_initial_encoder", initial_encoder)
-        object.__setattr__(self, "_decoders", decoders)
-        object.__setattr__(self, "_encoders", encoders)
-        object.__setattr__(self, "_norms", norms)
-
-    @staticmethod
-    def pool_hidden(hidden: torch.Tensor) -> torch.Tensor:
-        pooled = hidden.mean(dim=1)
-        if pooled.dtype != hidden.dtype:
-            pooled = pooled.to(dtype=hidden.dtype)
-        return pooled
-
-    def initial_state(self, canvas: torch.Tensor) -> torch.Tensor:
-        return self._initial_encoder(self.pool_hidden(canvas))
-
-    def decode(self, state: torch.Tensor, region_index: int) -> torch.Tensor:
-        return self._decoders[region_index](state)
-
-    def update(
-        self,
-        region_output: torch.Tensor,
-        previous_state: torch.Tensor,
-        region_index: int,
-        raw_update_scale: torch.Tensor,
-    ) -> LegacyInterfaceUpdate:
-        pooled_region_output = self.pool_hidden(region_output)
-        delta_state = self._encoders[region_index](pooled_region_output)
-        update_scale = torch.tanh(raw_update_scale)
-        pre_norm_state = previous_state + update_scale * delta_state
-        state = self._norms[region_index](pre_norm_state)
-        return LegacyInterfaceUpdate(
-            state=state,
-            pooled_region_output=pooled_region_output,
-            delta_state=delta_state,
-            update_scale=update_scale,
-            pre_norm_state=pre_norm_state,
-        )

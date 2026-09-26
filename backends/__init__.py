@@ -1,4 +1,3 @@
-from .backbone_stack import BackboneStackRegionBackend
 from .base import RegionBackend, RegionForwardCache
 from .mamba3 import (
     MAMBA3_SCAN_INPUT_NAMES,
@@ -9,12 +8,8 @@ from .mamba3 import (
     Mamba3RegionCache,
     NativeMamba3Lowering,
     NativeMamba3MixerLowering,
-    RegionLocalAutogradMamba3Lowering,
-    TileLangPBatchedMamba3Lowering,
-    TileLangPBatchedMamba3MixerLowering,
     TorchAutogradMamba3Lowering,
     TorchAutogradMamba3MixerLowering,
-    TritonMamba3MixerLowering,
     mamba3_block_input_pullback_native,
     mamba3_block_param_vjp_native,
     mamba3_mixer_input_pullback_native,
@@ -29,7 +24,6 @@ from .transformer import (
     TransformerRegionCache,
 )
 __all__ = [
-    "BackboneStackRegionBackend",
     "MAMBA3_SCAN_INPUT_NAMES",
     "Mamba3LayerCache",
     "Mamba3Lowering",
@@ -37,15 +31,11 @@ __all__ = [
     "Mamba3RegionBackend",
     "Mamba3RegionCache",
     "NativeMamba3Lowering",
-    "RegionLocalAutogradMamba3Lowering",
     "NativeMamba3MixerLowering",
-    "TileLangPBatchedMamba3Lowering",
-    "TileLangPBatchedMamba3MixerLowering",
     "RegionBackend",
     "RegionForwardCache",
     "TorchAutogradMamba3Lowering",
     "TorchAutogradMamba3MixerLowering",
-    "TritonMamba3MixerLowering",
     "mamba3_block_input_pullback_native",
     "mamba3_block_param_vjp_native",
     "mamba3_mixer_input_pullback_native",
@@ -57,3 +47,7 @@ __all__ = [
     "TransformerRegionBackend",
     "TransformerRegionCache",
 ]
+
+from backends.hybrid import HybridRegionBackend, HybridRegionCache
+
+__all__ += ["HybridRegionBackend", "HybridRegionCache"]
