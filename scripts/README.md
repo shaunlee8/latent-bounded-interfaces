@@ -10,7 +10,7 @@ Common environment: `PYTHONPATH=<repo>`; `LBI_DATA_ROOT` and
 `--tokenizer-path`); `RUN_ROOT=<checkpoint and log root>`. One H100 per
 training run, four H100s of one node for the four-device rows.
 
-## 1. Training (Table 1, Section 4.1, Appendix D)
+## 1. Training (Table 1, Section 4.1, Appendix E)
 
 Wrappers: `scripts/train_lbi_paper.sh` (bounded-interface) and
 `scripts/train_dense_paper.sh` (dense). Fixed for every row: `SEQ_LEN=1024`,
@@ -27,17 +27,17 @@ the architecture: `mid:mamba3` = 18L/1024d (120M), `canonical:mamba3` = 14L/768d
 | Table 1 Mamba-3 | mamba3 / mid | 32 x 90000 | 6e-4 / 6e-4 | 500 (seed 7 LBI), 1000 (others) | 0.03 | 7, 8, 9 dense; 7, 8, 10 LBI |
 | Table 1 Transformer | transformer / mid | 16 x 180000 | 6e-4 / 6e-4 | 1000 | 0.01 | 7, 8, 10 |
 | Table 1 Hybrid | hybrid / mid | 32 x 90000 | 1.2e-3 / 6e-4 | 1000 | 0.01 | 7, 8, 10 |
-| rank rows r = 8, 32 (App. D.1) | mamba3 / mid, `MESSAGE_DIM=8|32` | 32 x 90000 | 6e-4 | 1000 | 0.03 | 7, 8, 9 |
-| window row (App. D.1) | mamba3 / mid, `CANVAS_GRAD_WINDOW=32 CANVAS_GRAD_WINDOW_LR_MULT=8` | 32 x 90000 | 6e-4 | 1000 | 0.03 | 7, 8 |
-| truncated rank sweep, Mamba-3 (App. D.1) | mamba3 / mid, `MESSAGE_DIM=8|16|32|64 LR_SCHEDULE_STEPS=90000` | 16 x 15000 | 6e-4 | 500 | 0.03 | 7 |
-| truncated rank sweep, Transformer (App. D.1) | transformer / mid, `MESSAGE_DIM=8|16|32|64 LR_SCHEDULE_STEPS=180000` | 16 x 15000 | 6e-4 | 1000 | 0.01 | 9, 10 |
-| truncated rank sweep, Hybrid (App. D.1) | hybrid / mid, `MESSAGE_DIM=8|16|32|64 LR_SCHEDULE_STEPS=90000` | 32 x 15000 | 6e-4 | 1000 | 0.01 | 7, 10 |
-| granularity (App. D.2) | mamba3 / mid, `REGION_SIZE=2|3|6|9` | 16 x 90000 | 3e-4 (dense reference 6e-4) | 500 | 0.03 | 7, 8, 9 |
-| 54M pair (App. D.2) | mamba3 / canonical | 32 x 90000 | 8e-4 / 1.2e-3 | 500 | 0.03 | 7, 8, 9 |
-| 321M pair (App. D.2) | mamba3 / large | 8 x 360000 | 6e-4 / 4.5e-4 | 500 | 0.03 | 7, 8 |
+| rank rows r = 8, 32 (App. E.1) | mamba3 / mid, `MESSAGE_DIM=8|32` | 32 x 90000 | 6e-4 | 1000 | 0.03 | 7, 8, 9 |
+| window row (App. E.1) | mamba3 / mid, `CANVAS_GRAD_WINDOW=32 CANVAS_GRAD_WINDOW_LR_MULT=8` | 32 x 90000 | 6e-4 | 1000 | 0.03 | 7, 8 |
+| truncated rank sweep, Mamba-3 (App. E.1) | mamba3 / mid, `MESSAGE_DIM=8|16|32|64 LR_SCHEDULE_STEPS=90000` | 16 x 15000 | 6e-4 | 500 | 0.03 | 7 |
+| truncated rank sweep, Transformer (App. E.1) | transformer / mid, `MESSAGE_DIM=8|16|32|64 LR_SCHEDULE_STEPS=180000` | 16 x 15000 | 6e-4 | 1000 | 0.01 | 9, 10 |
+| truncated rank sweep, Hybrid (App. E.1) | hybrid / mid, `MESSAGE_DIM=8|16|32|64 LR_SCHEDULE_STEPS=90000` | 32 x 15000 | 6e-4 | 1000 | 0.01 | 7, 10 |
+| granularity (App. E.2) | mamba3 / mid, `REGION_SIZE=2|3|6|9` | 16 x 90000 | 3e-4 (dense reference 6e-4) | 500 | 0.03 | 7, 8, 9 |
+| 54M pair (App. E.2) | mamba3 / canonical | 32 x 90000 | 8e-4 / 1.2e-3 | 500 | 0.03 | 7, 8, 9 |
+| 321M pair (App. E.2) | mamba3 / large | 8 x 360000 | 6e-4 / 4.5e-4 | 500 | 0.03 | 7, 8 |
 | 47M Transformer pair | transformer / canonical | 32 x 90000 | 6e-4 / 6e-4 | 1000 | 0.01 | 7 |
 | 61M Hybrid pair | hybrid / canonical | 32 x 90000 | 1.2e-3 / 1.2e-3 | 1000 | 0.01 | 7, 8, 9 |
-| parameter-matched dense (App. D.3) | mamba3 / matched (21L) and 16L/768d | 32 x 90000 | 8e-4, 1.2e-3 | 1000 | 0.03, 0.1 | 7 |
+| parameter-matched dense (App. E.3) | mamba3 / matched (21L) and 16L/768d | 32 x 90000 | 8e-4, 1.2e-3 | 1000 | 0.03, 0.1 | 7 |
 
 Example (Table 1, Mamba-3, bounded-interface, seed 8):
 
@@ -59,7 +59,7 @@ bracket; the picks are the values above.
 512 x 8 x 1024 = 4,194,304 held-out tokens, evaluation seed 12345, final
 checkpoint. `lm_eval_summary.json` holds `posthoc_val_ce_loss`.
 
-## 3. Single-device cost (Section 4.2, Appendix B, C.1)
+## 3. Single-device cost (Section 4.2, Appendix C, D.1)
 
     python scripts/construction_profile.py --backbone mamba3 \
       --layers 18 --dim 1024 --rank 16 --seq-len 1024 --batch 32 --output profile_r16.json
@@ -70,7 +70,7 @@ check. Kernel breakdown: `nsys profile` of the same construction, then
 `nsys stats --report cuda_gpu_kern_sum`; counters: `ncu` on the recurrence and
 chunked-scan kernels.
 
-## 4. Gradient parity (Appendix D)
+## 4. Gradient parity (Appendix E)
 
     python scripts/appendix/gradient_error_vs_k.py --backbone mamba3|transformer|hybrid \
       --dim 512 --rank 16 --region-size 2 --regions 2 3 4 7 10 14 --dtypes float32 bfloat16 \
@@ -82,7 +82,7 @@ gradients; unsupported combinations (Mamba-3 and Hybrid in float32, the
 Transformer's forward-mode construction in float32, the Hybrid at K not
 divisible by 2) are recorded as error rows.
 
-## 5. Four-device rows (Tables 2 and 3, Appendix C)
+## 5. Four-device rows (Tables 2 and 3, Appendix D)
 
 Region-parallel step (`--rank 16|8|2`, `--backbone mamba3|transformer|hybrid`):
 
@@ -103,7 +103,7 @@ Emulated link (Table 2 "emul." columns and the full grid): the same commands wit
 (`LBI_EMU_P2P_SCALE=0.5|0.25` for the compressed-pipeline proxies; RTT 0.1 for the
 bandwidth-to-95% column); log names `netx_<scheme>_bw<Mbit>_rtt<ms>_<mode>_rep<i>.log`.
 
-Shaped link (Table 2 "shaped" columns, the round-trip table of Appendix C): NCCL over TCP on
+Shaped link (Table 2 "shaped" columns, the round-trip table of Appendix D): NCCL over TCP on
 the loopback interface, shaped with Linux traffic control (root):
 
     tc qdisc add dev lo root handle 1: tbf rate <Mbit>mbit burst 16mb latency 400ms
